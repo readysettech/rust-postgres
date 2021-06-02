@@ -159,6 +159,7 @@ pub struct Config {
     pub(crate) keepalives_idle: Duration,
     pub(crate) target_session_attrs: TargetSessionAttrs,
     pub(crate) channel_binding: ChannelBinding,
+    pub(crate) replication: Option<String>,
 }
 
 impl Default for Config {
@@ -184,6 +185,7 @@ impl Config {
             keepalives_idle: Duration::from_secs(2 * 60 * 60),
             target_session_attrs: TargetSessionAttrs::Any,
             channel_binding: ChannelBinding::Prefer,
+            replication: None,
         }
     }
 
@@ -221,6 +223,12 @@ impl Config {
     /// Defaults to the user.
     pub fn dbname(&mut self, dbname: &str) -> &mut Config {
         self.dbname = Some(dbname.to_string());
+        self
+    }
+
+    /// Sets the kind of replication.
+    pub fn set_replication_database(&mut self) -> &mut Config {
+        self.replication = Some("database".to_string());
         self
     }
 
@@ -475,6 +483,9 @@ impl Config {
                     }
                 };
                 self.channel_binding(channel_binding);
+            }
+            "replication" => {
+                self.replication = Some(value.to_string());
             }
             key => {
                 return Err(Error::config_parse(Box::new(UnknownOption(

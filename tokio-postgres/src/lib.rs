@@ -113,7 +113,7 @@
 //! | `with-uuid-0_8` | Enable support for the `uuid` crate. | [uuid](https://crates.io/crates/uuid) 0.8 | no |
 //! | `with-time-0_2` | Enable support for the `time` crate. | [time](https://crates.io/crates/time) 0.2 | no |
 #![doc(html_root_url = "https://docs.rs/tokio-postgres/0.7")]
-#![warn(rust_2018_idioms, clippy::all, missing_docs)]
+#![warn(rust_2018_idioms, clippy::all)]
 
 pub use crate::cancel_token::CancelToken;
 pub use crate::client::Client;
@@ -138,6 +138,7 @@ pub use crate::to_statement::ToStatement;
 pub use crate::transaction::Transaction;
 pub use crate::transaction_builder::{IsolationLevel, TransactionBuilder};
 use crate::types::ToSql;
+pub use postgres_protocol::message::backend::Message;
 
 pub mod binary_copy;
 mod bind;
@@ -145,8 +146,8 @@ mod bind;
 mod cancel_query;
 mod cancel_query_raw;
 mod cancel_token;
-mod client;
-mod codec;
+pub mod client;
+pub mod codec;
 pub mod config;
 #[cfg(feature = "runtime")]
 mod connect;
@@ -154,7 +155,7 @@ mod connect_raw;
 #[cfg(feature = "runtime")]
 mod connect_socket;
 mod connect_tls;
-mod connection;
+pub mod connection;
 mod copy_in;
 mod copy_out;
 pub mod error;
@@ -164,7 +165,7 @@ mod portal;
 mod prepare;
 mod query;
 pub mod row;
-mod simple_query;
+pub mod simple_query;
 #[cfg(feature = "runtime")]
 mod socket;
 mod statement;
