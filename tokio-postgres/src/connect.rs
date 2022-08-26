@@ -40,6 +40,15 @@ where
         return Err(Error::config("invalid number of ports".into()));
     }
 
+    if !config.hostaddr.is_empty() && config.hostaddr.len() != config.host.len() {
+        let msg = format!(
+            "invalid number of hostaddrs ({}). Possible values: 0 or number of hosts ({})",
+            config.hostaddr.len(),
+            config.host.len(),
+        );
+        return Err(Error::config(msg.into()));
+    }
+
     let mut error = None;
     for i in 0..num_hosts {
         let host = config.host.get(i);
