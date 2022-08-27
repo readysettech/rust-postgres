@@ -42,11 +42,20 @@ where
 
     if !config.hostaddr.is_empty() && config.hostaddr.len() != config.host.len() {
         let msg = format!(
-            "invalid number of hostaddrs ({}). Possible values: 0 or number of hosts ({})",
-            config.hostaddr.len(),
+            "number of hosts ({}) is different from number of hostaddrs ({})",
             config.host.len(),
+            config.hostaddr.len(),
         );
         return Err(Error::config(msg.into()));
+    }
+
+    // At this point, either one of the following two scenarios could happen:
+    // (1) either config.host or config.hostaddr must be empty;
+    // (2) if both config.host and config.hostaddr are NOT empty; their lengths must be equal.
+    let num_hosts = cmp::max(config.host.len(), config.hostaddr.len());
+
+    if config.port.len() > 1 && config.port.len() != num_hosts {
+        return Err(Error::config("invalid number of ports".into()));
     }
 
     let mut error = None;
