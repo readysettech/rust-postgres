@@ -1112,4 +1112,10 @@ mod tests {
 
         assert_eq!(1, 1);
     }
+
+    #[test]
+    fn test_invalid_hostaddr_parsing() {
+        let s = "user=pass_user dbname=postgres host=host1 hostaddr=127.0.0 port=26257";
+        s.parse::<Config>().err().unwrap();
+    }
 }
