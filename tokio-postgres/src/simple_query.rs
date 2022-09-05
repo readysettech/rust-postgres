@@ -7,7 +7,7 @@ use fallible_iterator::FallibleIterator;
 use futures::{ready, Stream};
 use log::debug;
 use pin_project_lite::pin_project;
-use postgres_protocol::message::backend::Message;
+use postgres_protocol::message::backend::{OwnedField, Message};
 use postgres_protocol::message::frontend;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
@@ -38,7 +38,7 @@ pub async fn simple_query(client: &InnerClient, query: &str) -> Result<SimpleQue
 
     Ok(SimpleQueryStream {
         responses,
-        columns: None,
+        fields: None,
         _p: PhantomPinned,
     })
 }
@@ -72,7 +72,7 @@ pin_project! {
     /// A stream of simple query results.
     pub struct SimpleQueryStream {
         responses: Responses,
-        columns: Option<Arc<[SimpleColumn]>>,
+        fields: Option<Arc<[OwnedField]>>,
         #[pin]
         _p: PhantomPinned,
     }
@@ -100,18 +100,18 @@ impl Stream for SimpleQueryStream {
                     return Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(0))));
                 }
                 Message::RowDescription(body) => {
-                    let columns = body
+                    let fields = body
                         .fields()
-                        .map(|f| Ok(SimpleColumn::new(f.name().to_string())))
+                        .map(|f| Ok(f.into()))
                         .collect::<Vec<_>>()
                         .map_err(Error::parse)?
                         .into();
 
-                    *this.columns = Some(columns);
+                    *this.fields = Some(fields);
                 }
                 Message::DataRow(body) => {
-                    let row = match &this.columns {
-                        Some(columns) => SimpleQueryRow::new(columns.clone(), body)?,
+                    let row = match &this.fields {
+                        Some(fields) => SimpleQueryRow::new(fields.clone(), body)?,
                         None => return Poll::Ready(Some(Err(Error::unexpected_message()))),
                     };
                     return Poll::Ready(Some(Ok(SimpleQueryMessage::Row(row))));
