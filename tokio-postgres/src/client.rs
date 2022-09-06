@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::Instrument;
 
 pub struct Responses {
     receiver: mpsc::Receiver<BackendMessages>,
@@ -396,8 +397,14 @@ impl Client {
         I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
-        let statement = statement.__convert().into_statement(self).await?;
-        query::generic_query(&self.inner, statement, params).await
+        let statement = statement
+            .__convert()
+            .into_statement(self)
+            .instrument(tracing::info_span!("converting into statement"))
+            .await?;
+        query::generic_query(&self.inner, statement, params)
+            .instrument(tracing::info_span!("generic_query inner"))
+            .await
     }
 
     /// Executes a statement, returning the number of rows modified.

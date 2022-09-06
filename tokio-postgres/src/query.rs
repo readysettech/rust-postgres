@@ -13,6 +13,8 @@ use std::fmt;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tracing::span;
+use tracing::Instrument;
 
 struct BorrowToSqlParamsDebug<'a, T>(&'a [T]);
 
@@ -66,18 +68,25 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
-    let buf = if log_enabled!(Level::Debug) {
-        let params = params.into_iter().collect::<Vec<_>>();
-        debug!(
-            "executing statement {} with parameters: {:?}",
-            statement.name(),
-            BorrowToSqlParamsDebug(params.as_slice()),
-        );
-        encode(client, &statement, params)?
-    } else {
-        encode(client, &statement, params)?
+    let buf = {
+        let span = span!(tracing::Level::TRACE, "encoding in tokio_postgres");
+        if log_enabled!(Level::Debug) {
+            let params = params.into_iter().collect::<Vec<_>>();
+            debug!(
+                "executing statement {} with parameters: {:?}",
+                statement.name(),
+                BorrowToSqlParamsDebug(params.as_slice()),
+            );
+            let _enter = span.enter();
+            encode(client, &statement, params)?
+        } else {
+            let _enter = span.enter();
+            encode(client, &statement, params)?
+        }
     };
-    let responses = start(client, buf).await?;
+    let responses = start(client, buf)
+        .instrument(tracing::info_span!("start(client, buf)"))
+        .await?;
     Ok(ResultStream {
         statement,
         responses,
@@ -167,9 +176,22 @@ where
 {
     client.with_buf(|buf| {
         encode_bind(statement, params, "", buf)?;
-        frontend::execute("", 0, buf).map_err(Error::encode)?;
-        frontend::sync(buf);
-        Ok(buf.split().freeze())
+        {
+            let span = span!(tracing::Level::TRACE, "frontend::execute");
+            let _enter = span.enter();
+            frontend::execute("", 0, buf).map_err(Error::encode)?;
+        }
+        {
+            let span = span!(tracing::Level::TRACE, "frontend::sync");
+            let _enter = span.enter();
+            frontend::sync(buf);
+        }
+        let bytes = {
+            let span = span!(tracing::Level::TRACE, "buf.split().freeze()");
+            let _enter = span.enter();
+            buf.split().freeze()
+        };
+        Ok(bytes)
     })
 }
 
@@ -184,6 +206,8 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
+    let span = span!(tracing::Level::TRACE, "encode_bind");
+    let _enter = span.enter();
     let params = params.into_iter();
 
     assert!(
