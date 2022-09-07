@@ -206,7 +206,7 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
-    let span = span!(tracing::Level::TRACE, "encode_bind");
+    let span = span!(tracing::Level::TRACE, "encode_bind.");
     let _enter = span.enter();
     let params = params.into_iter();
 
