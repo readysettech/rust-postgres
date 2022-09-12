@@ -141,6 +141,7 @@ pub use crate::to_statement::ToStatement;
 pub use crate::transaction::Transaction;
 pub use crate::transaction_builder::{IsolationLevel, TransactionBuilder};
 use crate::types::ToSql;
+pub use postgres_protocol::message::backend::OwnedField;
 pub use postgres_protocol::message::backend::Message;
 
 pub mod binary_copy;
@@ -240,6 +241,7 @@ pub enum AsyncMessage {
 
 /// Message returned by the `SimpleQuery` stream.
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum SimpleQueryMessage {
     /// A row of data.
     Row(SimpleQueryRow),
