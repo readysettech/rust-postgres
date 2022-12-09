@@ -1,19 +1,52 @@
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{format_ident, quote};
 use std::iter;
-use syn::{Data, DataStruct, DeriveInput, Error, Fields, Ident};
+use syn::{
+    punctuated::Punctuated, token, AngleBracketedGenericArguments, Data, DataStruct, DeriveInput,
+    Error, Fields, GenericArgument, GenericParam, Generics, Ident, Lifetime, LifetimeDef,
+    PathArguments, PathSegment,
+};
+use syn::{TraitBound, TraitBoundModifier, TypeParamBound};
 
 use crate::accepts;
 use crate::composites::Field;
+use crate::composites::{append_generic_bound, new_derive_path};
 use crate::enums::Variant;
 use crate::overrides::Overrides;
 
 pub fn expand_derive_fromsql(input: DeriveInput) -> Result<TokenStream, Error> {
     let overrides = Overrides::extract(&input.attrs)?;
 
+    if overrides.name.is_some() && overrides.transparent {
+        return Err(Error::new_spanned(
+            &input,
+            "#[postgres(transparent)] is not allowed with #[postgres(name = \"...\")]",
+        ));
+    }
+
     let name = overrides.name.unwrap_or_else(|| input.ident.to_string());
 
-    let (accepts_body, to_sql_body) = match input.data {
+    let (accepts_body, to_sql_body) = if overrides.transparent {
+        match input.data {
+            Data::Struct(DataStruct {
+                fields: Fields::Unnamed(ref fields),
+                ..
+            }) if fields.unnamed.len() == 1 => {
+                let field = fields.unnamed.first().unwrap();
+                (
+                    accepts::transparent_body(field),
+                    transparent_body(&input.ident, field),
+                )
+            }
+            _ => {
+                return Err(Error::new_spanned(
+                    input,
+                    "#[postgres(transparent)] may only be applied to single field tuple structs",
+                ))
+            }
+        }
+    } else {
+        match input.data {
         Data::Enum(ref data) => {
             let variants = data
                 .variants
@@ -55,13 +88,17 @@ pub fn expand_derive_fromsql(input: DeriveInput) -> Result<TokenStream, Error> {
                 "#[derive(FromSql)] may only be applied to structs, single field tuple structs, and enums",
             ))
         }
+    }
     };
 
     let ident = &input.ident;
+    let (generics, lifetime) = build_generics(&input.generics);
+    let (impl_generics, _, _) = generics.split_for_impl();
+    let (_, ty_generics, where_clause) = input.generics.split_for_impl();
     let out = quote! {
-        impl<'a> postgres_types::FromSql<'a> for #ident {
-            fn from_sql(_type: &postgres_types::Type, buf: &'a [u8])
-                        -> std::result::Result<#ident,
+        impl#impl_generics postgres_types::FromSql<#lifetime> for #ident#ty_generics #where_clause {
+            fn from_sql(_type: &postgres_types::Type, buf: &#lifetime [u8])
+                        -> std::result::Result<#ident#ty_generics,
                                                std::boxed::Box<dyn std::error::Error +
                                                                std::marker::Sync +
                                                                std::marker::Send>> {
@@ -75,6 +112,13 @@ pub fn expand_derive_fromsql(input: DeriveInput) -> Result<TokenStream, Error> {
     };
 
     Ok(out)
+}
+
+fn transparent_body(ident: &Ident, field: &syn::Field) -> TokenStream {
+    let ty = &field.ty;
+    quote! {
+        <#ty as postgres_types::FromSql>::from_sql(_type, buf).map(#ident)
+    }
 }
 
 fn enum_body(ident: &Ident, variants: &[Variant]) -> TokenStream {
@@ -119,7 +163,7 @@ fn domain_body(ident: &Ident, field: &syn::Field) -> TokenStream {
 fn composite_body(ident: &Ident, fields: &[Field]) -> TokenStream {
     let temp_vars = &fields
         .iter()
-        .map(|f| Ident::new(&format!("__{}", f.ident), Span::call_site()))
+        .map(|f| format_ident!("__{}", f.ident))
         .collect::<Vec<_>>();
     let field_names = &fields.iter().map(|f| &f.name).collect::<Vec<_>>();
     let field_idents = &fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
@@ -164,4 +208,36 @@ fn composite_body(ident: &Ident, fields: &[Field]) -> TokenStream {
             )*
         })
     }
+}
+
+fn build_generics(source: &Generics) -> (Generics, Lifetime) {
+    // don't worry about lifetime name collisions, it doesn't make sense to derive FromSql on a struct with a lifetime
+    let lifetime = Lifetime::new("'a", Span::call_site());
+
+    let mut out = append_generic_bound(source.to_owned(), &new_fromsql_bound(&lifetime));
+    out.params.insert(
+        0,
+        GenericParam::Lifetime(LifetimeDef::new(lifetime.to_owned())),
+    );
+
+    (out, lifetime)
+}
+
+fn new_fromsql_bound(lifetime: &Lifetime) -> TypeParamBound {
+    let mut path_segment: PathSegment = Ident::new("FromSql", Span::call_site()).into();
+    let mut seg_args = Punctuated::new();
+    seg_args.push(GenericArgument::Lifetime(lifetime.to_owned()));
+    path_segment.arguments = PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+        colon2_token: None,
+        lt_token: token::Lt::default(),
+        args: seg_args,
+        gt_token: token::Gt::default(),
+    });
+
+    TypeParamBound::Trait(TraitBound {
+        lifetimes: None,
+        modifier: TraitBoundModifier::None,
+        paren_token: None,
+        path: new_derive_path(path_segment),
+    })
 }

@@ -4,7 +4,7 @@ use crate::connection::RequestMessages;
 use crate::types::{BorrowToSql, IsNull};
 use crate::{Error, GenericResult, Portal, Row, Statement};
 use bytes::{Bytes, BytesMut};
-use futures::{ready, Stream};
+use futures_util::{ready, Stream};
 use log::{debug, log_enabled, Level};
 use pin_project_lite::pin_project;
 use postgres_protocol::message::backend::Message;
@@ -128,11 +128,12 @@ where
     };
     let mut responses = start(client, buf).await?;
 
+    let mut rows = 0;
     loop {
         match responses.next().await? {
             Message::DataRow(_) => {}
             Message::CommandComplete(body) => {
-                let rows = body
+                rows = body
                     .tag()
                     .map_err(Error::parse)?
                     .rsplit(' ')
@@ -140,9 +141,9 @@ where
                     .unwrap()
                     .parse()
                     .unwrap_or(0);
-                return Ok(rows);
             }
-            Message::EmptyQueryResponse => return Ok(0),
+            Message::EmptyQueryResponse => rows = 0,
+            Message::ReadyForQuery(_) => return Ok(rows),
             _ => return Err(Error::unexpected_message()),
         }
     }
@@ -184,21 +185,29 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
+    let param_types = statement.params();
     let params = params.into_iter();
 
     assert!(
-        statement.params().len() == params.len(),
+        param_types.len() == params.len(),
         "expected {} parameters but got {}",
-        statement.params().len(),
+        param_types.len(),
         params.len()
     );
+
+    let (param_formats, params): (Vec<_>, Vec<_>) = params
+        .zip(param_types.iter())
+        .map(|(p, ty)| (p.borrow_to_sql().encode_format(ty) as i16, p))
+        .unzip();
+
+    let params = params.into_iter();
 
     let mut error_idx = 0;
     let r = frontend::bind(
         portal,
         statement.name(),
-        Some(1),
-        params.zip(statement.params()).enumerate(),
+        param_formats,
+        params.zip(param_types).enumerate(),
         |(idx, (param, ty)), buf| match param.borrow_to_sql().to_sql_checked(ty, buf) {
             Ok(IsNull::No) => Ok(postgres_protocol::IsNull::No),
             Ok(IsNull::Yes) => Ok(postgres_protocol::IsNull::Yes),
@@ -272,15 +281,17 @@ impl Stream for RowStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
-        match ready!(this.responses.poll_next(cx)?) {
-            Message::DataRow(body) => {
-                Poll::Ready(Some(Ok(Row::new(this.statement.clone(), body)?)))
+        loop {
+            match ready!(this.responses.poll_next(cx)?) {
+                Message::DataRow(body) => {
+                    return Poll::Ready(Some(Ok(Row::new(this.statement.clone(), body)?)))
+                }
+                Message::EmptyQueryResponse
+                | Message::CommandComplete(_)
+                | Message::PortalSuspended => {}
+                Message::ReadyForQuery(_) => return Poll::Ready(None),
+                _ => return Poll::Ready(Some(Err(Error::unexpected_message()))),
             }
-            Message::EmptyQueryResponse
-            | Message::CommandComplete(_)
-            | Message::PortalSuspended => Poll::Ready(None),
-            Message::ErrorResponse(body) => Poll::Ready(Some(Err(Error::db(body)))),
-            _ => Poll::Ready(Some(Err(Error::unexpected_message()))),
         }
     }
 }

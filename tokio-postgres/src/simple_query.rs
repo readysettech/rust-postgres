@@ -4,7 +4,7 @@ use crate::connection::RequestMessages;
 use crate::{Error, SimpleQueryMessage, SimpleQueryRow};
 use bytes::Bytes;
 use fallible_iterator::FallibleIterator;
-use futures::{ready, Stream};
+use futures_util::{ready, Stream};
 use log::debug;
 use pin_project_lite::pin_project;
 use postgres_protocol::message::backend::{OwnedField, Message};
@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// Information about a column of a single query row.
+#[derive(Debug)]
 pub struct SimpleColumn {
     name: String,
 }

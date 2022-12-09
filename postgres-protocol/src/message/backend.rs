@@ -558,6 +558,7 @@ impl CopyBothResponseBody {
 }
 
 #[derive(PartialEq, Eq)]
+#[derive(Debug)]
 pub struct DataRowBody {
     storage: Bytes,
     len: u16,

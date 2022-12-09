@@ -55,6 +55,21 @@
 //! struct SessionId(Vec<u8>);
 //! ```
 //!
+//! ## Newtypes
+//!
+//! The `#[postgres(transparent)]` attribute can be used on a single-field tuple struct to create a
+//! Rust-only wrapper type that will use the [`ToSql`] & [`FromSql`] implementation of the inner
+//! value :
+//! ```rust
+//! # #[cfg(feature = "derive")]
+//! use postgres_types::{ToSql, FromSql};
+//!
+//! # #[cfg(feature = "derive")]
+//! #[derive(Debug, ToSql, FromSql)]
+//! #[postgres(transparent)]
+//! struct UserId(i32);
+//! ```
+//!
 //! ## Composites
 //!
 //! Postgres composite types correspond to structs in Rust:
@@ -197,6 +212,8 @@ where
 mod bit_vec_06;
 #[cfg(feature = "with-chrono-0_4")]
 mod chrono_04;
+#[cfg(feature = "with-cidr-0_2")]
+mod cidr_02;
 #[cfg(feature = "with-eui48-0_4")]
 mod eui48_04;
 #[cfg(feature = "with-eui48-1")]
@@ -207,12 +224,16 @@ mod geo_types_06;
 mod geo_types_07;
 #[cfg(feature = "with-serde_json-1")]
 mod serde_json_1;
+#[cfg(feature = "with-smol_str-01")]
+mod smol_str_01;
 #[cfg(feature = "with-time-0_2")]
 mod time_02;
 #[cfg(feature = "with-time-0_3")]
 mod time_03;
 #[cfg(feature = "with-uuid-0_8")]
 mod uuid_08;
+#[cfg(feature = "with-uuid-1")]
+mod uuid_1;
 
 // The time::{date, time} macros produce compile errors if the crate package is renamed.
 #[cfg(feature = "with-time-0_2")]
@@ -299,6 +320,8 @@ pub enum Kind {
     Array(Type),
     /// A range type along with the type of its elements.
     Range(Type),
+    /// A multirange type along with the type of its elements.
+    Multirange(Type),
     /// A domain type along with its underlying type.
     Domain(Type),
     /// A composite type along with information about its fields.
@@ -390,6 +413,7 @@ impl WrongType {
 /// | `f32`                             | REAL                                          |
 /// | `f64`                             | DOUBLE PRECISION                              |
 /// | `&str`/`String`                   | VARCHAR, CHAR(n), TEXT, CITEXT, NAME, UNKNOWN |
+/// |                                   | LTREE, LQUERY, LTXTQUERY                      |
 /// | `&[u8]`/`Vec<u8>`                 | BYTEA                                         |
 /// | `HashMap<String, Option<String>>` | HSTORE                                        |
 /// | `SystemTime`                      | TIMESTAMP, TIMESTAMP WITH TIME ZONE           |
@@ -421,6 +445,11 @@ impl WrongType {
 /// | `uuid::Uuid`                    | UUID                                |
 /// | `bit_vec::BitVec`               | BIT, VARBIT                         |
 /// | `eui48::MacAddress`             | MACADDR                             |
+/// | `cidr::InetCidr`                | CIDR                                |
+/// | `cidr::InetAddr`                | INET                                |
+/// | `smol_str::SmolStr`             | VARCHAR, CHAR(n), TEXT, CITEXT,     |
+/// |                                 | NAME, UNKNOWN, LTREE, LQUERY,       |
+/// |                                 | LTXTQUERY                           |
 ///
 /// # Nullability
 ///
@@ -430,10 +459,11 @@ impl WrongType {
 ///
 /// # Arrays
 ///
-/// `FromSql` is implemented for `Vec<T>` and `[T; N]` where `T` implements
-/// `FromSql`, and corresponds to one-dimensional Postgres arrays. **Note:**
-/// the impl for arrays only exist when the Cargo feature `array-impls` is
-/// enabled.
+/// `FromSql` is implemented for `Vec<T>`, `Box<[T]>` and `[T; N]` where `T`
+/// implements `FromSql`, and corresponds to one-dimensional Postgres arrays.
+///
+/// **Note:** the impl for arrays only exist when the Cargo feature `array-impls`
+/// is enabled.
 pub trait FromSql<'a>: Sized {
     /// Creates a new value of this type from a buffer of data of the specified
     /// Postgres `Type` in its binary format.
@@ -558,6 +588,16 @@ impl<'a, T: FromSql<'a>, const N: usize> FromSql<'a> for [T; N] {
     }
 }
 
+impl<'a, T: FromSql<'a>> FromSql<'a> for Box<[T]> {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        Vec::<T>::from_sql(ty, raw).map(Vec::into_boxed_slice)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        Vec::<T>::accepts(ty)
+    }
+}
+
 impl<'a> FromSql<'a> for Vec<u8> {
     fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Vec<u8>, Box<dyn Error + Sync + Send>> {
         Ok(types::bytea_from_sql(raw).to_owned())
@@ -575,8 +615,20 @@ impl<'a> FromSql<'a> for &'a [u8] {
 }
 
 impl<'a> FromSql<'a> for String {
-    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
-        types::text_from_sql(raw).map(ToString::to_string)
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
+        <&str as FromSql>::from_sql(ty, raw).map(ToString::to_string)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <&str as FromSql>::accepts(ty)
+    }
+}
+
+impl<'a> FromSql<'a> for Box<str> {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Box<str>, Box<dyn Error + Sync + Send>> {
+        <&str as FromSql>::from_sql(ty, raw)
+            .map(ToString::to_string)
+            .map(String::into_boxed_str)
     }
 
     fn accepts(ty: &Type) -> bool {
@@ -585,14 +637,26 @@ impl<'a> FromSql<'a> for String {
 }
 
 impl<'a> FromSql<'a> for &'a str {
-    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<&'a str, Box<dyn Error + Sync + Send>> {
-        types::text_from_sql(raw)
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<&'a str, Box<dyn Error + Sync + Send>> {
+        match *ty {
+            ref ty if ty.name() == "ltree" => types::ltree_from_sql(raw),
+            ref ty if ty.name() == "lquery" => types::lquery_from_sql(raw),
+            ref ty if ty.name() == "ltxtquery" => types::ltxtquery_from_sql(raw),
+            _ => types::text_from_sql(raw),
+        }
     }
 
     fn accepts(ty: &Type) -> bool {
         match *ty {
             Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME | Type::UNKNOWN => true,
-            ref ty if ty.name() == "citext" => true,
+            ref ty
+                if (ty.name() == "citext"
+                    || ty.name() == "ltree"
+                    || ty.name() == "lquery"
+                    || ty.name() == "ltxtquery") =>
+            {
+                true
+            }
             _ => false,
         }
     }
@@ -643,7 +707,7 @@ impl<'a> FromSql<'a> for SystemTime {
         let epoch = UNIX_EPOCH + Duration::from_secs(TIME_SEC_CONVERSION);
 
         let negative = time < 0;
-        let time = time.abs() as u64;
+        let time = time.unsigned_abs();
 
         let secs = time / USEC_PER_SEC;
         let nsec = (time % USEC_PER_SEC) * NSEC_PER_USEC;
@@ -696,7 +760,8 @@ pub enum IsNull {
 /// | `f32`                             | REAL                                 |
 /// | `f64`                             | DOUBLE PRECISION                     |
 /// | `&str`/`String`                   | VARCHAR, CHAR(n), TEXT, CITEXT, NAME |
-/// | `&[u8]`/`Vec<u8>`                 | BYTEA                                |
+/// |                                   | LTREE, LQUERY, LTXTQUERY             |
+/// | `&[u8]`/`Vec<u8>`/`[u8; N]`       | BYTEA                                |
 /// | `HashMap<String, Option<String>>` | HSTORE                               |
 /// | `SystemTime`                      | TIMESTAMP, TIMESTAMP WITH TIME ZONE  |
 /// | `IpAddr`                          | INET                                 |
@@ -736,10 +801,12 @@ pub enum IsNull {
 ///
 /// # Arrays
 ///
-/// `ToSql` is implemented for `Vec<T>`, `&[T]` and `[T; N]` where `T`
-/// implements `ToSql`, and corresponds to one-dimensional Postgres arrays with
-/// an index offset of 1. **Note:** the impl for arrays only exist when the
-/// Cargo feature `array-impls` is enabled.
+/// `ToSql` is implemented for `[u8; N]`, `Vec<T>`, `&[T]`, `Box<[T]>` and `[T; N]`
+/// where `T` implements `ToSql` and `N` is const usize, and corresponds to one-dimensional
+/// Postgres arrays with an index offset of 1.
+///
+/// **Note:** the impl for arrays only exist when the Cargo feature `array-impls`
+/// is enabled.
 pub trait ToSql: fmt::Debug {
     /// Converts the value of `self` into the binary format of the specified
     /// Postgres `Type`, appending it to `out`.
@@ -769,6 +836,22 @@ pub trait ToSql: fmt::Debug {
         ty: &Type,
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>>;
+
+    /// Specify the encode format
+    fn encode_format(&self, _ty: &Type) -> Format {
+        Format::Binary
+    }
+}
+
+/// Supported Postgres message format types
+///
+/// Using Text format in a message assumes a Postgres `SERVER_ENCODING` of `UTF8`
+#[derive(Clone, Copy, Debug)]
+pub enum Format {
+    /// Text format (UTF-8)
+    Text,
+    /// Compact, typed binary format
+    Binary,
 }
 
 impl<'a, T> ToSql for &'a T
@@ -785,6 +868,10 @@ where
 
     fn accepts(ty: &Type) -> bool {
         T::accepts(ty)
+    }
+
+    fn encode_format(&self, ty: &Type) -> Format {
+        (*self).encode_format(ty)
     }
 
     to_sql_checked!();
@@ -804,6 +891,13 @@ impl<T: ToSql> ToSql for Option<T> {
 
     fn accepts(ty: &Type) -> bool {
         <T as ToSql>::accepts(ty)
+    }
+
+    fn encode_format(&self, ty: &Type) -> Format {
+        match self {
+            Some(ref val) => val.encode_format(ty),
+            None => Format::Binary,
+        }
     }
 
     to_sql_checked!();
@@ -846,7 +940,19 @@ impl<'a, T: ToSql> ToSql for &'a [T] {
 
 impl<'a> ToSql for &'a [u8] {
     fn to_sql(&self, _: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-        types::bytea_to_sql(*self, w);
+        types::bytea_to_sql(self, w);
+        Ok(IsNull::No)
+    }
+
+    accepts!(BYTEA);
+
+    to_sql_checked!();
+}
+
+#[cfg(feature = "array-impls")]
+impl<const N: usize> ToSql for [u8; N] {
+    fn to_sql(&self, _: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        types::bytea_to_sql(&self[..], w);
         Ok(IsNull::No)
     }
 
@@ -880,6 +986,18 @@ impl<T: ToSql> ToSql for Vec<T> {
     to_sql_checked!();
 }
 
+impl<T: ToSql> ToSql for Box<[T]> {
+    fn to_sql(&self, ty: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        <&[T] as ToSql>::to_sql(&&**self, ty, w)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <&[T] as ToSql>::accepts(ty)
+    }
+
+    to_sql_checked!();
+}
+
 impl ToSql for Vec<u8> {
     fn to_sql(&self, ty: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         <&[u8] as ToSql>::to_sql(&&**self, ty, w)
@@ -893,15 +1011,27 @@ impl ToSql for Vec<u8> {
 }
 
 impl<'a> ToSql for &'a str {
-    fn to_sql(&self, _: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-        types::text_to_sql(*self, w);
+    fn to_sql(&self, ty: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        match *ty {
+            ref ty if ty.name() == "ltree" => types::ltree_to_sql(self, w),
+            ref ty if ty.name() == "lquery" => types::lquery_to_sql(self, w),
+            ref ty if ty.name() == "ltxtquery" => types::ltxtquery_to_sql(self, w),
+            _ => types::text_to_sql(self, w),
+        }
         Ok(IsNull::No)
     }
 
     fn accepts(ty: &Type) -> bool {
         match *ty {
             Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME | Type::UNKNOWN => true,
-            ref ty if ty.name() == "citext" => true,
+            ref ty
+                if (ty.name() == "citext"
+                    || ty.name() == "ltree"
+                    || ty.name() == "lquery"
+                    || ty.name() == "ltxtquery") =>
+            {
+                true
+            }
             _ => false,
         }
     }
@@ -922,6 +1052,18 @@ impl<'a> ToSql for Cow<'a, str> {
 }
 
 impl ToSql for String {
+    fn to_sql(&self, ty: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        <&str as ToSql>::to_sql(&&**self, ty, w)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <&str as ToSql>::accepts(ty)
+    }
+
+    to_sql_checked!();
+}
+
+impl ToSql for Box<str> {
     fn to_sql(&self, ty: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         <&str as ToSql>::to_sql(&&**self, ty, w)
     }
@@ -1041,6 +1183,23 @@ impl BorrowToSql for &dyn ToSql {
     #[inline]
     fn borrow_to_sql(&self) -> &dyn ToSql {
         *self
+    }
+}
+
+impl sealed::Sealed for Box<dyn ToSql + Sync> {}
+
+impl BorrowToSql for Box<dyn ToSql + Sync> {
+    #[inline]
+    fn borrow_to_sql(&self) -> &dyn ToSql {
+        self.as_ref()
+    }
+}
+
+impl sealed::Sealed for Box<dyn ToSql + Sync + Send> {}
+impl BorrowToSql for Box<dyn ToSql + Sync + Send> {
+    #[inline]
+    fn borrow_to_sql(&self) -> &dyn ToSql {
+        self.as_ref()
     }
 }
 

@@ -1,9 +1,13 @@
-use crate::codec::BackendMessages;
-use crate::config::{Host, SslMode};
+use crate::codec::{BackendMessages, FrontendMessage};
+#[cfg(feature = "runtime")]
+use crate::config::Host;
+use crate::config::SslMode;
 use crate::connection::{Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
 use crate::generic_result::GenericResult;
 use crate::query::{ResultStream, RowStream};
+#[cfg(feature = "runtime")]
+use crate::keepalive::KeepaliveConfig;
 use crate::simple_query::SimpleQueryStream;
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
@@ -17,15 +21,16 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use futures::channel::mpsc;
-use futures::{future, pin_mut, ready, StreamExt, TryStreamExt};
+use futures_channel::mpsc;
+use futures_util::{future, pin_mut, ready, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
-use postgres_protocol::message::backend::Message;
+use postgres_protocol::message::{backend::Message, frontend};
 use postgres_types::BorrowToSql;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+#[cfg(feature = "runtime")]
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -146,13 +151,13 @@ impl InnerClient {
     }
 }
 
+#[cfg(feature = "runtime")]
 #[derive(Clone)]
 pub(crate) struct SocketConfig {
     pub host: Host,
     pub port: u16,
     pub connect_timeout: Option<Duration>,
-    pub keepalives: bool,
-    pub keepalives_idle: Duration,
+    pub keepalive: Option<KeepaliveConfig>,
 }
 
 /// An asynchronous PostgreSQL client.
@@ -354,7 +359,7 @@ impl Client {
     /// ```no_run
     /// # async fn async_main(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
     /// use tokio_postgres::types::ToSql;
-    /// use futures::{pin_mut, TryStreamExt};
+    /// use futures_util::{pin_mut, TryStreamExt};
     ///
     /// let params: Vec<String> = vec![
     ///     "first param".into(),
@@ -521,7 +526,42 @@ impl Client {
     ///
     /// The transaction will roll back by default - use the `commit` method to commit it.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        self.batch_execute("BEGIN").await?;
+        struct RollbackIfNotDone<'me> {
+            client: &'me Client,
+            done: bool,
+        }
+
+        impl<'a> Drop for RollbackIfNotDone<'a> {
+            fn drop(&mut self) {
+                if self.done {
+                    return;
+                }
+
+                let buf = self.client.inner().with_buf(|buf| {
+                    frontend::query("ROLLBACK", buf).unwrap();
+                    buf.split().freeze()
+                });
+                let _ = self
+                    .client
+                    .inner()
+                    .send(RequestMessages::Single(FrontendMessage::Raw(buf)));
+            }
+        }
+
+        // This is done, as `Future` created by this method can be dropped after
+        // `RequestMessages` is synchronously send to the `Connection` by
+        // `batch_execute()`, but before `Responses` is asynchronously polled to
+        // completion. In that case `Transaction` won't be created and thus
+        // won't be rolled back.
+        {
+            let mut cleaner = RollbackIfNotDone {
+                client: self,
+                done: false,
+            };
+            self.batch_execute("BEGIN").await?;
+            cleaner.done = true;
+        }
+
         Ok(Transaction::new(self))
     }
 
