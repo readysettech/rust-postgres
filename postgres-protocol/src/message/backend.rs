@@ -435,13 +435,23 @@ impl BackendKeyDataBody {
 }
 
 pub struct CommandCompleteBody {
-    tag: Bytes,
+    pub tag: Bytes,
 }
 
 impl CommandCompleteBody {
     #[inline]
     pub fn tag(&self) -> io::Result<&str> {
         get_str(&self.tag)
+    }
+
+    #[inline]
+    pub fn tag_bytes(&self) -> &Bytes {
+        &self.tag
+    }
+
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        self.tag
     }
 }
 
@@ -566,10 +576,7 @@ pub struct DataRowBody {
 impl DataRowBody {
     #[inline]
     pub fn new(storage: Bytes, len: u16) -> DataRowBody {
-        Self {
-            storage,
-            len,
-        }
+        Self { storage, len }
     }
 
     #[inline]
@@ -803,6 +810,7 @@ impl ReadyForQueryBody {
     }
 }
 
+#[derive(Debug)]
 pub struct RowDescriptionBody {
     storage: Bytes,
     len: u16,
@@ -1007,6 +1015,6 @@ fn find_null(buf: &[u8], start: usize) -> io::Result<usize> {
 }
 
 #[inline]
-fn get_str(buf: &[u8]) -> io::Result<&str> {
+pub fn get_str(buf: &[u8]) -> io::Result<&str> {
     str::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
