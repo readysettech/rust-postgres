@@ -118,6 +118,8 @@
 //! | `with-time-0_3` | Enable support for the 0.3 version of the `time` crate. | [time](https://crates.io/crates/time/0.3.0) 0.3 | no |
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
 
+use std::sync::Arc;
+
 pub use crate::cancel_token::CancelToken;
 pub use crate::client::Client;
 pub use crate::config::Config;
@@ -142,8 +144,8 @@ pub use crate::to_statement::ToStatement;
 pub use crate::transaction::Transaction;
 pub use crate::transaction_builder::{IsolationLevel, TransactionBuilder};
 use crate::types::ToSql;
-pub use postgres_protocol::message::backend::Message;
-pub use postgres_protocol::message::backend::OwnedField;
+use bytes::Bytes;
+pub use postgres_protocol::message::backend::{Message, OwnedField};
 
 pub mod binary_copy;
 mod bind;
@@ -250,8 +252,18 @@ pub enum SimpleQueryMessage {
     Row(SimpleQueryRow),
     /// A statement in the query has completed.
     ///
-    /// The number of rows modified or selected is returned.
-    CommandComplete(u64),
+    /// The full tag, along with the rows modified or selected are returned.
+    CommandComplete(CommandCompleteContents),
+}
+
+#[derive(Eq, PartialEq, Debug)]
+pub struct CommandCompleteContents {
+    /// Fields, if relevant for the CommandCompleteContents.
+    pub fields: Option<Arc<[OwnedField]>>,
+    /// The number of rows modified or selected.
+    pub rows: u64,
+    /// The full tag in bytes of the CommandComplete body.
+    pub tag: Bytes,
 }
 
 fn slice_iter<'a>(
