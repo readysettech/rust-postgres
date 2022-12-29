@@ -41,6 +41,7 @@ pub async fn simple_query(client: &InnerClient, query: &str) -> Result<SimpleQue
     Ok(SimpleQueryStream {
         responses,
         fields: None,
+        include_fields_in_complete: true,
         _p: PhantomPinned,
     })
 }
@@ -75,6 +76,7 @@ pin_project! {
     pub struct SimpleQueryStream {
         responses: Responses,
         fields: Option<Arc<[OwnedField]>>,
+        include_fields_in_complete: bool,
         #[pin]
         _p: PhantomPinned,
     }
@@ -89,7 +91,13 @@ impl Stream for SimpleQueryStream {
             match ready!(this.responses.poll_next(cx)?) {
                 Message::CommandComplete(body) => {
                     let rows = extract_row_affected(&body)?;
-                    let fields = this.fields.clone();
+                    let fields = if *this.include_fields_in_complete {
+                        this.fields.clone()
+                    } else {
+                        // Reset bool for next grouping
+                        *this.include_fields_in_complete = true;
+                        None
+                    };
                     return Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(
                         crate::CommandCompleteContents {
                             fields,
@@ -99,7 +107,13 @@ impl Stream for SimpleQueryStream {
                     ))));
                 }
                 Message::EmptyQueryResponse => {
-                    let fields = this.fields.clone();
+                    let fields = if *this.include_fields_in_complete {
+                        this.fields.clone()
+                    } else {
+                        // Reset bool for next grouping
+                        *this.include_fields_in_complete = true;
+                        None
+                    };
                     return Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(
                         crate::CommandCompleteContents {
                             fields,
@@ -120,7 +134,10 @@ impl Stream for SimpleQueryStream {
                 }
                 Message::DataRow(body) => {
                     let row = match &this.fields {
-                        Some(fields) => SimpleQueryRow::new(fields.clone(), body)?,
+                        Some(fields) => {
+                            *this.include_fields_in_complete = false;
+                            SimpleQueryRow::new(fields.clone(), body)?
+                        }
                         None => return Poll::Ready(Some(Err(Error::unexpected_message()))),
                     };
                     return Poll::Ready(Some(Ok(SimpleQueryMessage::Row(row))));
