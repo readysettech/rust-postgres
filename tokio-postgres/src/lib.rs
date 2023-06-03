@@ -169,6 +169,7 @@ mod copy_out;
 pub mod error;
 mod generic_client;
 pub mod generic_result;
+#[cfg(not(target_arch = "wasm32"))]
 mod keepalive;
 mod maybe_tls_stream;
 mod portal;
