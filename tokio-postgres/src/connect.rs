@@ -77,10 +77,8 @@ where
             Some(Host::Unix(_)) => None,
             None => None,
         };
-        let tls = hostname
-            .as_ref()
-            .map(|s| tls.make_tls_connect(s))
-            .transpose()
+        let tls = tls
+            .make_tls_connect(hostname.as_deref().unwrap_or(""))
             .map_err(|e| Error::tls(e.into()))?;
 
         // Try to use the value of hostaddr to establish the TCP connection,
@@ -110,7 +108,7 @@ async fn connect_once<T>(
     host: Host,
     hostname: Option<String>,
     port: u16,
-    tls: Option<T>,
+    tls: T,
     config: &Config,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
@@ -128,7 +126,8 @@ where
         },
     )
     .await?;
-    let (mut client, mut connection) = connect_raw(socket, tls, config).await?;
+    let has_hostname = hostname.is_some();
+    let (mut client, mut connection) = connect_raw(socket, tls, has_hostname, config).await?;
 
     if let TargetSessionAttrs::ReadWrite = config.target_session_attrs {
         let rows = client.simple_query_raw("SHOW transaction_read_only");
