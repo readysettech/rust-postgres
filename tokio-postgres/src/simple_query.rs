@@ -1,4 +1,4 @@
-se crate::client::{InnerClient, Responses};
+use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::query::extract_row_affected;

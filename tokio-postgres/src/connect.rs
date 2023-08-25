@@ -42,7 +42,6 @@ where
         return Err(Error::config("invalid number of ports".into()));
     }
 
-<<<<<<< HEAD
     if !config.hostaddr.is_empty() && config.hostaddr.len() != config.host.len() {
         let msg = format!(
             "number of hosts ({}) is different from number of hostaddrs ({})",
@@ -61,14 +60,11 @@ where
         return Err(Error::config("invalid number of ports".into()));
     }
 
-||||||| parent of 3346858d (Implement load balancing)
-=======
     let mut indices = (0..num_hosts).collect::<Vec<_>>();
     if config.load_balance_hosts == LoadBalanceHosts::Random {
         indices.shuffle(&mut rand::thread_rng());
     }
 
->>>>>>> 3346858d (Implement load balancing)
     let mut error = None;
     for i in indices {
         let host = config.host.get(i);
