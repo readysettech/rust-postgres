@@ -272,15 +272,9 @@ impl Stream for ResultStream {
             )?)))),
             Message::CommandComplete(body) => {
                 // parse value from bytes
-                let val = body
-                    .tag()
-                    .map_err(Error::parse)?
-                    .rsplit(' ')
-                    .next()
-                    .unwrap()
-                    .parse()
-                    .unwrap_or(0);
-                Poll::Ready(Some(Ok(GenericResult::NumRows(val))))
+                let tag = body.tag().map_err(Error::parse)?;
+                let val = tag.rsplit(' ').next().unwrap().parse().unwrap_or(0);
+                Poll::Ready(Some(Ok(GenericResult::Command(val, tag.to_string()))))
             }
             Message::EmptyQueryResponse | Message::PortalSuspended => Poll::Ready(None),
             Message::ErrorResponse(body) => Poll::Ready(Some(Err(Error::db(body)))),

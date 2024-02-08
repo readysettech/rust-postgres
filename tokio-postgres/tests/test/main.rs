@@ -210,7 +210,7 @@ async fn generic_query() {
 
     let rows_written = match insert[0] {
         GenericResult::Row(_) => 0, // failure case
-        GenericResult::NumRows(r) => r,
+        GenericResult::Command(r, _) => r,
     };
     assert_eq!(rows_written, 2);
     let mut s = select.iter();
@@ -226,7 +226,7 @@ async fn generic_query() {
     } else {
         panic!();
     }
-    if let GenericResult::NumRows(rows_read) = s.next().unwrap() {
+    if let GenericResult::Command(rows_read, _) = s.next().unwrap() {
         assert_eq!(*rows_read, 2);
     } else {
         panic!();

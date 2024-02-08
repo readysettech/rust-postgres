@@ -5,5 +5,5 @@ use crate::Row;
 #[derive(Debug)]
 pub enum GenericResult {
     Row(Row),
-    NumRows(u64),
+    Command(u64, String),
 }
