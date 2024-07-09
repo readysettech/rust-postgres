@@ -4,7 +4,7 @@ use crate::connection::RequestMessages;
 use crate::error::SqlState;
 use crate::types::{Field, Kind, Oid, Type};
 use crate::{Column, Error, Statement};
-use crate::{query, slice_iter};
+use crate::{GenericResult, Row, query, slice_iter};
 use bytes::Bytes;
 use fallible_iterator::FallibleIterator;
 use futures_util::TryStreamExt;
@@ -95,13 +95,13 @@ pub async fn prepare(
         let mut it = row_description.fields();
         while let Some(field) = it.next().map_err(Error::parse)? {
             let type_ = get_type(client, field.type_oid()).await?;
-            let column = Column {
-                name: field.name().to_string(),
-                table_oid: Some(field.table_oid()).filter(|n| *n != 0),
-                column_id: Some(field.column_id()).filter(|n| *n != 0),
-                type_modifier: field.type_modifier(),
-                r#type: type_,
-            };
+            let column = Column::new(
+                field.name().to_string(),
+                type_,
+                Some(field.table_oid()).filter(|oid| *oid != 0),
+                Some(field.column_id()).filter(|id| *id != 0),
+                field.type_modifier(),
+            );
             columns.push(column);
         }
     }
@@ -145,9 +145,12 @@ pub(crate) async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type
 
     let mut rows = pin!(query::query(client, stmt, slice_iter(&[&oid])).await?);
 
-    let row = match rows.try_next().await? {
-        Some(row) => row,
-        None => return Err(Error::unexpected_message()),
+    let row = loop {
+        match rows.try_next().await? {
+            Some(GenericResult::Row(row)) => break row,
+            Some(GenericResult::Command(_, _)) => {}
+            None => return Err(Error::unexpected_message()),
+        }
     };
 
     let name: String = row.try_get(0)?;
@@ -214,7 +217,12 @@ async fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<St
 
     query::query(client, stmt, slice_iter(&[&oid]))
         .await?
-        .and_then(|row| async move { row.try_get(0) })
+        .try_filter_map(|result| async move {
+            match result {
+                GenericResult::Row(row) => Ok(Some(row.try_get(0)?)),
+                GenericResult::Command(_, _) => Ok(None),
+            }
+        })
         .try_collect()
         .await
 }
@@ -241,7 +249,13 @@ async fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec
 
     let rows = query::query(client, stmt, slice_iter(&[&oid]))
         .await?
-        .try_collect::<Vec<_>>()
+        .try_filter_map(|result| async move {
+            match result {
+                GenericResult::Row(row) => Ok(Some(row)),
+                GenericResult::Command(_, _) => Ok(None),
+            }
+        })
+        .try_collect::<Vec<Row>>()
         .await?;
 
     let mut fields = vec![];

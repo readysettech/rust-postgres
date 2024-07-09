@@ -6,7 +6,7 @@ use crate::statement::Column;
 use crate::types::{FromSql, Type, WrongType};
 use crate::{Error, Statement};
 use fallible_iterator::FallibleIterator;
-use postgres_protocol::message::backend::DataRowBody;
+use postgres_protocol::message::backend::{DataRowBody, OwnedField};
 use std::fmt;
 use std::io;
 use std::ops::Range;
@@ -30,6 +30,12 @@ impl AsName for Column {
 impl AsName for String {
     fn as_name(&self) -> &str {
         self
+    }
+}
+
+impl AsName for OwnedField {
+    fn as_name(&self) -> &str {
+        self.name()
     }
 }
 
@@ -146,6 +152,11 @@ impl Row {
         self.columns().len()
     }
 
+    /// Returns the DataRowBody which stores the row as Bytes.
+    pub fn body(&self) -> &DataRowBody {
+        &self.body
+    }
+
     /// Deserializes a value from the row.
     ///
     /// The value can be specified either by its numeric index in the row, or by its column name.
@@ -216,27 +227,24 @@ impl AsName for SimpleColumn {
 /// A row of data returned from the database by a simple query.
 #[derive(Debug)]
 pub struct SimpleQueryRow {
-    columns: Arc<[SimpleColumn]>,
+    fields: Arc<[OwnedField]>,
     body: DataRowBody,
     ranges: Vec<Option<Range<usize>>>,
 }
 
 impl SimpleQueryRow {
     #[allow(clippy::new_ret_no_self)]
-    pub(crate) fn new(
-        columns: Arc<[SimpleColumn]>,
-        body: DataRowBody,
-    ) -> Result<SimpleQueryRow, Error> {
+    pub fn new(fields: Arc<[OwnedField]>, body: DataRowBody) -> Result<SimpleQueryRow, Error> {
         let ranges = body.ranges().collect().map_err(Error::parse)?;
         let row = SimpleQueryRow {
-            columns,
+            fields,
             body,
             ranges,
         };
         // The DataRow field count is sent by the server independently of the
         // RowDescription column count; a mismatch would make column accessors
         // index `ranges` out of bounds and panic, so reject it up front.
-        if row.ranges.len() != row.columns.len() {
+        if row.ranges.len() != row.fields.len() {
             return Err(Error::parse(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "DataRow field count does not match the number of columns",
@@ -245,9 +253,18 @@ impl SimpleQueryRow {
         Ok(row)
     }
 
-    /// Returns information about the columns of data in the row.
-    pub fn columns(&self) -> &[SimpleColumn] {
-        &self.columns
+    /// Returns information about the columns of data in the row. Performs an allocation to return
+    /// each name as a `SimpleColumn`. To avoid the allocation, use `SimpleQueryRow::fields()`.
+    pub fn columns(&self) -> Vec<SimpleColumn> {
+        self.fields
+            .iter()
+            .map(|f| SimpleColumn::new(f.name().to_string()))
+            .collect()
+    }
+
+    /// Returns the fields found in the RowDescription message with information on each column.
+    pub fn fields(&self) -> &[OwnedField] {
+        &self.fields
     }
 
     /// Determines if the row contains no values.
@@ -257,7 +274,12 @@ impl SimpleQueryRow {
 
     /// Returns the number of values in the row.
     pub fn len(&self) -> usize {
-        self.columns.len()
+        self.fields.len()
+    }
+
+    /// Returns the DataRowBody which stores the row as Bytes.
+    pub fn body(&self) -> &DataRowBody {
+        &self.body
     }
 
     /// Returns a value from the row.
@@ -290,7 +312,7 @@ impl SimpleQueryRow {
     where
         I: RowIndex + fmt::Display,
     {
-        let idx = match idx.__idx(&self.columns) {
+        let idx = match idx.__idx(&self.fields) {
             Some(idx) => idx,
             None => return Err(Error::column(idx.to_string())),
         };

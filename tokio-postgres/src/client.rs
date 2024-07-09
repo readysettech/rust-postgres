@@ -4,17 +4,19 @@ use crate::codec::{BackendMessages, FrontendMessage};
 use crate::config::{SslMode, SslNegotiation};
 use crate::connection::{Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
+use crate::generic_result::GenericResult;
 #[cfg(feature = "runtime")]
 use crate::keepalive::KeepaliveConfig;
-use crate::query::RowStream;
+use crate::query::{ResultStream, RowStream};
 use crate::simple_query::SimpleQueryStream;
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
 use crate::tls::TlsConnect;
 use crate::types::{Oid, ToSql, Type};
 use crate::{
-    CancelToken, CopyInSink, Error, Row, SimpleQueryMessage, Statement, ToStatement, Transaction,
-    TransactionBuilder, copy_in, copy_out, prepare, query, simple_query, slice_iter,
+    CancelToken, CopyInSink, DEFAULT_RESULT_FORMATS, Error, Row, SimpleQueryMessage, Statement,
+    ToStatement, Transaction, TransactionBuilder, copy_in, copy_out, prepare, query, simple_query,
+    slice_iter,
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
@@ -211,7 +213,7 @@ impl Client {
         }
     }
 
-    pub(crate) fn inner(&self) -> &Arc<InnerClient> {
+    pub fn inner(&self) -> &Arc<InnerClient> {
         &self.inner
     }
 
@@ -258,6 +260,28 @@ impl Client {
     {
         self.query_raw(statement, slice_iter(params))
             .await?
+            .try_filter_map(|result| async move {
+                match result {
+                    GenericResult::Row(row) => Ok(Some(row)),
+                    GenericResult::Command(_, _) => Ok(None),
+                }
+            })
+            .try_collect()
+            .await
+    }
+
+    /// Executes a statement and returns a read or write response
+    pub async fn generic_query<T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<GenericResult>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        // try_collect will wait for the ReadyForQuery message which is not strictly necessary.
+        self.generic_query_raw(statement, slice_iter(params), DEFAULT_RESULT_FORMATS)
+            .await?
             .try_collect()
             .await
     }
@@ -274,6 +298,12 @@ impl Client {
         let rows: Vec<Row> = self
             .query_raw(statement, slice_iter(params))
             .await?
+            .try_filter_map(|result| async move {
+                match result {
+                    GenericResult::Row(row) => Ok(Some(row)),
+                    GenericResult::Command(_, _) => Ok(None),
+                }
+            })
             .try_collect()
             .await?;
 
@@ -355,11 +385,15 @@ impl Client {
         // However, this new form with only one .await in a loop generates
         // slightly smaller codegen/stack usage for the resulting future.
         while let Some(row) = stream.try_next().await? {
-            if first.is_some() {
-                return Err(Error::row_count());
+            match row {
+                GenericResult::Row(row) => {
+                    if first.is_some() {
+                        return Err(Error::row_count());
+                    }
+                    first = Some(row);
+                }
+                GenericResult::Command(_, _) => {}
             }
-
-            first = Some(row);
         }
 
         Ok(first)
@@ -412,9 +446,11 @@ impl Client {
     ///     params,
     /// ).await?);
     ///
-    /// while let Some(row) = it.try_next().await? {
-    ///     let foo: i32 = row.get("foo");
-    ///     println!("foo: {}", foo);
+    /// while let Some(result) = it.try_next().await? {
+    ///     if let tokio_postgres::GenericResult::Row(row) = result {
+    ///         let foo: i32 = row.get("foo");
+    ///         println!("foo: {}", foo);
+    ///     }
     /// }
     /// # Ok(())
     /// # }
@@ -444,10 +480,20 @@ impl Client {
         query: &str,
         params: &[(&(dyn ToSql + Sync), Type)],
     ) -> Result<Vec<Row>, Error> {
-        self.query_typed_raw(query, params.iter().map(|(v, t)| (*v, t.clone())))
-            .await?
-            .try_collect()
-            .await
+        self.query_typed_raw(
+            query,
+            params.iter().map(|(v, t)| (*v, t.clone())),
+            DEFAULT_RESULT_FORMATS,
+        )
+        .await?
+        .try_filter_map(|result| async move {
+            match result {
+                GenericResult::Row(row) => Ok(Some(row)),
+                GenericResult::Command(_, _) => Ok(None),
+            }
+        })
+        .try_collect()
+        .await
     }
 
     /// Like `query_one`, but requires the types of query parameters to be explicitly specified.
@@ -492,8 +538,12 @@ impl Client {
         params: &[(&(dyn ToSql + Sync), Type)],
     ) -> Result<Option<Row>, Error> {
         let mut stream = pin!(
-            self.query_typed_raw(statement, params.iter().map(|(v, t)| (*v, t.clone())))
-                .await?
+            self.query_typed_raw(
+                statement,
+                params.iter().map(|(v, t)| (*v, t.clone())),
+                DEFAULT_RESULT_FORMATS,
+            )
+            .await?
         );
 
         let mut first = None;
@@ -504,11 +554,16 @@ impl Client {
         // However, this new form with only one .await in a loop generates
         // slightly smaller codegen/stack usage for the resulting future.
         while let Some(row) = stream.try_next().await? {
-            if first.is_some() {
-                return Err(Error::row_count());
-            }
+            match row {
+                GenericResult::Row(row) => {
+                    if first.is_some() {
+                        return Err(Error::row_count());
+                    }
 
-            first = Some(row);
+                    first = Some(row);
+                }
+                GenericResult::Command(_, _) => {}
+            }
         }
 
         Ok(first)
@@ -541,21 +596,58 @@ impl Client {
     /// let mut it = pin!(client.query_typed_raw(
     ///     "SELECT foo FROM bar WHERE biz = $1 AND baz = $2",
     ///     params,
+    ///     tokio_postgres::DEFAULT_RESULT_FORMATS,
     /// ).await?);
     ///
-    /// while let Some(row) = it.try_next().await? {
-    ///     let foo: i32 = row.get("foo");
-    ///     println!("foo: {}", foo);
+    /// while let Some(result) = it.try_next().await? {
+    ///     if let tokio_postgres::GenericResult::Row(row) = result {
+    ///         let foo: i32 = row.get("foo");
+    ///         println!("foo: {}", foo);
+    ///     }
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn query_typed_raw<P, I>(&self, query: &str, params: I) -> Result<RowStream, Error>
+    pub async fn query_typed_raw<P, I, J>(
+        &self,
+        query: &str,
+        params: I,
+        result_formats: J,
+    ) -> Result<RowStream, Error>
     where
         P: BorrowToSql,
         I: IntoIterator<Item = (P, Type)>,
+        J: IntoIterator<Item = i16>,
     {
-        query::query_typed(&self.inner, query, params).await
+        query::query_typed(&self.inner, query, params, result_formats).await
+    }
+
+    /// Executes a generic query.
+    ///
+    /// Note that the result_formats parameter allows us to specify result formats other than the
+    /// default Some(1) (i.e. the default of using the binary format for everything) *but* this
+    /// crate is mostly written under the assumption that we only use binary format. As such,
+    /// trying to use functions like `Row::get` on the result will fail if the FromSql impl on the
+    /// result type tries to decode the result; FromSql doesn't pass in a result format to its
+    /// `from_sql` callback because it's assumed by the trait that we always use binary format. As
+    /// such, passing in non-binary formats here is only useful if we're *not* planning on decoding
+    /// the result (such as in a case where we are merely proxying the raw row to a different
+    /// client) or if we've written custom FromSql impls that expect text instead of binary format.
+    pub async fn generic_query_raw<T, P, I, J>(
+        &self,
+        statement: &T,
+        params: I,
+        result_formats: J,
+    ) -> Result<ResultStream, Error>
+    where
+        T: ?Sized + ToStatement,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
+        J: IntoIterator<Item = i16>,
+    {
+        let statement = statement.__convert().into_statement(&self.inner).await?;
+        query::generic_query(&self.inner, statement, params, result_formats).await
     }
 
     /// Executes a statement, returning the number of rows modified.

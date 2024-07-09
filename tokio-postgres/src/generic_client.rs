@@ -1,6 +1,9 @@
 use crate::query::RowStream;
 use crate::types::{BorrowToSql, ToSql, Type};
-use crate::{Client, Error, Row, SimpleQueryMessage, Statement, ToStatement, Transaction};
+use crate::{
+    Client, DEFAULT_RESULT_FORMATS, Error, Row, SimpleQueryMessage, Statement, ToStatement,
+    Transaction,
+};
 use async_trait::async_trait;
 
 mod private {
@@ -211,7 +214,8 @@ impl GenericClient for Client {
         P: BorrowToSql,
         I: IntoIterator<Item = (P, Type)> + Sync + Send,
     {
-        self.query_typed_raw(statement, params).await
+        self.query_typed_raw(statement, params, DEFAULT_RESULT_FORMATS)
+            .await
     }
 
     async fn prepare(&self, query: &str) -> Result<Statement, Error> {
