@@ -32,6 +32,7 @@ pub const PARAMETER_STATUS_TAG: u8 = b'S';
 pub const PARAMETER_DESCRIPTION_TAG: u8 = b't';
 pub const ROW_DESCRIPTION_TAG: u8 = b'T';
 pub const READY_FOR_QUERY_TAG: u8 = b'Z';
+pub const COPY_BOTH_RESPONSE_TAG: u8 = b'W';
 
 #[derive(Debug, Copy, Clone)]
 pub struct Header {
@@ -93,6 +94,7 @@ pub enum Message {
     CopyDone,
     CopyInResponse(CopyInResponseBody),
     CopyOutResponse(CopyOutResponseBody),
+    CopyBothResponse(CopyBothResponseBody),
     DataRow(DataRowBody),
     EmptyQueryResponse,
     ErrorResponse(ErrorResponseBody),
@@ -185,6 +187,16 @@ impl Message {
                 let len = buf.read_u16::<BigEndian>()?;
                 let storage = buf.read_all();
                 Message::CopyOutResponse(CopyOutResponseBody {
+                    format,
+                    len,
+                    storage,
+                })
+            }
+            COPY_BOTH_RESPONSE_TAG => {
+                let format = buf.read_u8()?;
+                let len = buf.read_u16::<BigEndian>()?;
+                let storage = buf.read_all();
+                Message::CopyBothResponse(CopyBothResponseBody {
                     format,
                     len,
                     storage,
@@ -423,13 +435,23 @@ impl BackendKeyDataBody {
 }
 
 pub struct CommandCompleteBody {
-    tag: Bytes,
+    pub tag: Bytes,
 }
 
 impl CommandCompleteBody {
     #[inline]
     pub fn tag(&self) -> io::Result<&str> {
         get_str(&self.tag)
+    }
+
+    #[inline]
+    pub fn tag_bytes(&self) -> &Bytes {
+        &self.tag
+    }
+
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        self.tag
     }
 }
 
@@ -525,12 +547,39 @@ impl CopyOutResponseBody {
 }
 
 #[derive(Debug, Clone)]
+pub struct CopyBothResponseBody {
+    storage: Bytes,
+    len: u16,
+    format: u8,
+}
+
+impl CopyBothResponseBody {
+    #[inline]
+    pub fn format(&self) -> u8 {
+        self.format
+    }
+
+    #[inline]
+    pub fn column_formats(&self) -> ColumnFormats<'_> {
+        ColumnFormats {
+            remaining: self.len,
+            buf: &self.storage,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct DataRowBody {
     storage: Bytes,
     len: u16,
 }
 
 impl DataRowBody {
+    #[inline]
+    pub fn new(storage: Bytes, len: u16) -> DataRowBody {
+        Self { storage, len }
+    }
+
     #[inline]
     pub fn ranges(&self) -> DataRowRanges<'_> {
         DataRowRanges {
@@ -877,6 +926,91 @@ impl<'a> Field<'a> {
     #[inline]
     pub fn format(&self) -> i16 {
         self.format
+    }
+}
+
+/// A struct representing the fields of a RowDescription message. Clones the fields to avoid keeping
+/// the `RowDescriptionMessage`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct OwnedField {
+    name: String,
+    table_oid: Oid,
+    column_id: i16,
+    type_oid: Oid,
+    type_size: i16,
+    type_modifier: i32,
+    format: i16,
+}
+
+impl OwnedField {
+    #[inline]
+    pub fn new(
+        name: String,
+        table_oid: Oid,
+        column_id: i16,
+        type_oid: Oid,
+        type_size: i16,
+        type_modifier: i32,
+        format: i16,
+    ) -> Self {
+        Self {
+            name,
+            table_oid,
+            column_id,
+            type_oid,
+            type_size,
+            type_modifier,
+            format,
+        }
+    }
+
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[inline]
+    pub fn table_oid(&self) -> Oid {
+        self.table_oid
+    }
+
+    #[inline]
+    pub fn column_id(&self) -> i16 {
+        self.column_id
+    }
+
+    #[inline]
+    pub fn type_oid(&self) -> Oid {
+        self.type_oid
+    }
+
+    #[inline]
+    pub fn type_size(&self) -> i16 {
+        self.type_size
+    }
+
+    #[inline]
+    pub fn type_modifier(&self) -> i32 {
+        self.type_modifier
+    }
+
+    #[inline]
+    pub fn format(&self) -> i16 {
+        self.format
+    }
+}
+
+impl From<Field<'_>> for OwnedField {
+    fn from(f: Field<'_>) -> Self {
+        OwnedField {
+            name: f.name().to_string(),
+            table_oid: f.table_oid(),
+            column_id: f.column_id(),
+            type_oid: f.type_oid(),
+            type_size: f.type_size(),
+            type_modifier: f.type_modifier(),
+            format: f.format(),
+        }
     }
 }
 

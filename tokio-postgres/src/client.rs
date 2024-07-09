@@ -2,9 +2,10 @@ use crate::codec::{BackendMessages, FrontendMessage};
 use crate::config::SslMode;
 use crate::connection::{Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
+use crate::generic_result::GenericResult;
 #[cfg(feature = "runtime")]
 use crate::keepalive::KeepaliveConfig;
-use crate::query::RowStream;
+use crate::query::{ResultStream, RowStream};
 use crate::simple_query::SimpleQueryStream;
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
@@ -15,6 +16,7 @@ use crate::Socket;
 use crate::{
     copy_in, copy_out, prepare, query, simple_query, slice_iter, CancelToken, CopyInSink, Error,
     Row, SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
+    DEFAULT_RESULT_FORMATS,
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
@@ -205,7 +207,7 @@ impl Client {
         }
     }
 
-    pub(crate) fn inner(&self) -> &Arc<InnerClient> {
+    pub fn inner(&self) -> &Arc<InnerClient> {
         &self.inner
     }
 
@@ -256,6 +258,22 @@ impl Client {
             .await
     }
 
+    /// Executes a statement and returns a read or write response
+    pub async fn generic_query<T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<GenericResult>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        // try_collect will wait for the ReadyForQuery message which is not strictly necessary.
+        self.generic_query_raw(statement, slice_iter(params), DEFAULT_RESULT_FORMATS)
+            .await?
+            .try_collect()
+            .await
+    }
+
     /// Executes a statement which returns a single row, returning it.
     ///
     /// Returns an error if the query does not return exactly one row.
@@ -274,9 +292,19 @@ impl Client {
     where
         T: ?Sized + ToStatement,
     {
-        self.query_opt(statement, params)
-            .await
-            .and_then(|res| res.ok_or_else(Error::row_count))
+        let stream = self.query_raw(statement, slice_iter(params)).await?;
+        pin_mut!(stream);
+
+        let row = match stream.try_next().await? {
+            Some(row) => row,
+            None => return Err(Error::row_count()),
+        };
+
+        if stream.try_next().await?.is_some() {
+            return Err(Error::row_count());
+        }
+
+        Ok(row)
     }
 
     /// Executes a statements which returns zero or one rows, returning it.
@@ -300,22 +328,16 @@ impl Client {
         let stream = self.query_raw(statement, slice_iter(params)).await?;
         pin_mut!(stream);
 
-        let mut first = None;
+        let row = match stream.try_next().await? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
 
-        // Originally this was two calls to `try_next().await?`,
-        // once for the first element, and second to error if more than one.
-        //
-        // However, this new form with only one .await in a loop generates
-        // slightly smaller codegen/stack usage for the resulting future.
-        while let Some(row) = stream.try_next().await? {
-            if first.is_some() {
-                return Err(Error::row_count());
-            }
-
-            first = Some(row);
+        if stream.try_next().await?.is_some() {
+            return Err(Error::row_count());
         }
 
-        Ok(first)
+        Ok(Some(row))
     }
 
     /// The maximally flexible version of [`query`].
@@ -362,6 +384,34 @@ impl Client {
     {
         let statement = statement.__convert().into_statement(self).await?;
         query::query(&self.inner, statement, params).await
+    }
+
+    /// Executes a generic query.
+    ///
+    /// Note that the result_formats parameter allows us to specify result formats other than the
+    /// default Some(1) (i.e. the default of using the binary format for everything) *but* this
+    /// crate is mostly written under the assumption that we only use binary format. As such,
+    /// trying to use functions like `Row::get` on the result will fail if the FromSql impl on the
+    /// result type tries to decode the result; FromSql doesn't pass in a result format to its
+    /// `from_sql` callback because it's assumed by the trait that we always use binary format. As
+    /// such, passing in non-binary formats here is only useful if we're *not* planning on decoding
+    /// the result (such as in a case where we are merely proxying the raw row to a different
+    /// client) or if we've written custom FromSql impls that expect text instead of binary format.
+    pub async fn generic_query_raw<T, P, I, J>(
+        &self,
+        statement: &T,
+        params: I,
+        result_formats: J,
+    ) -> Result<ResultStream, Error>
+    where
+        T: ?Sized + ToStatement,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
+        J: IntoIterator<Item = i16>,
+    {
+        let statement = statement.__convert().into_statement(self).await?;
+        query::generic_query(&self.inner, statement, params, result_formats).await
     }
 
     /// Executes a statement, returning the number of rows modified.
@@ -447,7 +497,7 @@ impl Client {
         self.simple_query_raw(query).await?.try_collect().await
     }
 
-    pub(crate) async fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
+    pub async fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
         simple_query::simple_query(self.inner(), query).await
     }
 

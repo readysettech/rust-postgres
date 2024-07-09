@@ -185,20 +185,10 @@ where
 
             match next.await.transpose()? {
                 Some(SimpleQueryMessage::Row(row)) => {
-                    let read_only_result = row.try_get(0)?;
-                    if read_only_result == Some("on")
-                        && config.target_session_attrs == TargetSessionAttrs::ReadWrite
-                    {
+                    if row.try_get(0)? == Some("on") {
                         return Err(Error::connect(io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             "database does not allow writes",
-                        )));
-                    } else if read_only_result == Some("off")
-                        && config.target_session_attrs == TargetSessionAttrs::ReadOnly
-                    {
-                        return Err(Error::connect(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "database is not read only",
                         )));
                     } else {
                         break;
