@@ -94,6 +94,20 @@ pub struct Column {
 }
 
 impl Column {
+    pub(crate) fn new(
+        name: String,
+        r#type: Type,
+        table_oid: Option<u32>,
+        column_id: Option<i16>,
+    ) -> Column {
+        Column {
+            name,
+            r#type,
+            table_oid,
+            column_id,
+        }
+    }
+
     /// Returns the name of the column.
     pub fn name(&self) -> &str {
         &self.name

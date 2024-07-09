@@ -3,7 +3,7 @@ use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::prepare::get_type;
 use crate::types::{BorrowToSql, IsNull};
-use crate::{Column, Error, Portal, Row, Statement};
+use crate::{Column, Error, GenericResult, Portal, Row, Statement, DEFAULT_RESULT_FORMATS};
 use bytes::{Bytes, BytesMut};
 use fallible_iterator::FallibleIterator;
 use futures_util::{ready, Stream};
@@ -61,14 +61,16 @@ where
     })
 }
 
-pub async fn query_typed<'a, P, I>(
+pub async fn query_typed<'a, P, I, J>(
     client: &Arc<InnerClient>,
     query: &str,
     params: I,
+    result_formats: J,
 ) -> Result<RowStream, Error>
 where
     P: BorrowToSql,
     I: IntoIterator<Item = (P, Type)>,
+    J: IntoIterator<Item = i16>,
 {
     let buf = {
         let params = params.into_iter().collect::<Vec<_>>();
@@ -76,7 +78,7 @@ where
 
         client.with_buf(|buf| {
             frontend::parse("", query, param_oids.into_iter(), buf).map_err(Error::parse)?;
-            encode_bind_raw("", params, "", buf)?;
+            encode_bind_raw("", params, "", buf, result_formats)?;
             frontend::describe(b'S', "", buf).map_err(Error::encode)?;
             frontend::execute("", 0, buf).map_err(Error::encode)?;
             frontend::sync(buf);
@@ -121,6 +123,37 @@ where
             _ => return Err(Error::unexpected_message()),
         }
     }
+}
+
+pub async fn generic_query<P, I, J>(
+    client: &InnerClient,
+    statement: Statement,
+    params: I,
+    result_formats: J,
+) -> Result<ResultStream, Error>
+where
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
+    I::IntoIter: ExactSizeIterator,
+    J: IntoIterator<Item = i16>,
+{
+    let buf = if log_enabled!(Level::Debug) {
+        let params = params.into_iter().collect::<Vec<_>>();
+        debug!(
+            "executing statement {} with parameters: {:?}",
+            statement.name(),
+            BorrowToSqlParamsDebug(params.as_slice()),
+        );
+        encode_with_result_formats(client, &statement, params, result_formats)?
+    } else {
+        encode_with_result_formats(client, &statement, params, result_formats)?
+    };
+    let responses = start(client, buf).await?;
+    Ok(ResultStream {
+        statement,
+        responses,
+        _p: PhantomPinned,
+    })
 }
 
 pub async fn query_portal(
@@ -211,24 +244,41 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
+    encode_with_result_formats(client, statement, params, DEFAULT_RESULT_FORMATS)
+}
+
+pub fn encode_with_result_formats<P, I, J>(
+    client: &InnerClient,
+    statement: &Statement,
+    params: I,
+    result_formats: J,
+) -> Result<Bytes, Error>
+where
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
+    I::IntoIter: ExactSizeIterator,
+    J: IntoIterator<Item = i16>,
+{
     client.with_buf(|buf| {
-        encode_bind(statement, params, "", buf)?;
+        encode_bind(statement, params, "", buf, result_formats)?;
         frontend::execute("", 0, buf).map_err(Error::encode)?;
         frontend::sync(buf);
         Ok(buf.split().freeze())
     })
 }
 
-pub fn encode_bind<P, I>(
+pub fn encode_bind<P, I, J>(
     statement: &Statement,
     params: I,
     portal: &str,
     buf: &mut BytesMut,
+    result_formats: J,
 ) -> Result<(), Error>
 where
     P: BorrowToSql,
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
+    J: IntoIterator<Item = i16>,
 {
     let params = params.into_iter();
     if params.len() != statement.params().len() {
@@ -240,19 +290,22 @@ where
         params.zip(statement.params().iter().cloned()),
         portal,
         buf,
+        result_formats,
     )
 }
 
-fn encode_bind_raw<P, I>(
+fn encode_bind_raw<P, I, J>(
     statement_name: &str,
     params: I,
     portal: &str,
     buf: &mut BytesMut,
+    result_formats: J,
 ) -> Result<(), Error>
 where
     P: BorrowToSql,
     I: IntoIterator<Item = (P, Type)>,
     I::IntoIter: ExactSizeIterator,
+    J: IntoIterator<Item = i16>,
 {
     let (param_formats, params): (Vec<_>, Vec<_>) = params
         .into_iter()
@@ -273,13 +326,47 @@ where
                 Err(e)
             }
         },
-        Some(1),
+        result_formats,
         buf,
     );
     match r {
         Ok(()) => Ok(()),
         Err(frontend::BindError::Conversion(e)) => Err(Error::to_sql(e, error_idx)),
         Err(frontend::BindError::Serialization(e)) => Err(Error::encode(e)),
+    }
+}
+
+pin_project! {
+    /// A stream of table rows.
+    pub struct ResultStream {
+        statement: Statement,
+        responses: Responses,
+        #[pin]
+        _p: PhantomPinned,
+    }
+}
+
+impl Stream for ResultStream {
+    type Item = Result<GenericResult, Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        match ready!(this.responses.poll_next(cx)?) {
+            Message::DataRow(body) => Poll::Ready(Some(Ok(GenericResult::Row(Row::new(
+                this.statement.clone(),
+                body,
+            )?)))),
+            Message::CommandComplete(body) => {
+                // parse value from bytes
+                let tag = body.tag().map_err(Error::parse)?;
+                let val = tag.rsplit(' ').next().unwrap().parse().unwrap_or(0);
+                Poll::Ready(Some(Ok(GenericResult::Command(val, tag.to_string()))))
+            }
+            Message::EmptyQueryResponse | Message::PortalSuspended => Poll::Ready(None),
+            Message::ErrorResponse(body) => Poll::Ready(Some(Err(Error::db(body)))),
+            Message::ReadyForQuery(_) => Poll::Ready(None),
+            _ => Poll::Ready(Some(Err(Error::unexpected_message()))),
+        }
     }
 }
 
@@ -295,17 +382,25 @@ pin_project! {
 }
 
 impl Stream for RowStream {
-    type Item = Result<Row, Error>;
+    type Item = Result<GenericResult, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         loop {
             match ready!(this.responses.poll_next(cx)?) {
                 Message::DataRow(body) => {
-                    return Poll::Ready(Some(Ok(Row::new(this.statement.clone(), body)?)))
+                    return Poll::Ready(Some(Ok(GenericResult::Row(Row::new(
+                        this.statement.clone(),
+                        body,
+                    )?))))
                 }
                 Message::CommandComplete(body) => {
-                    *this.rows_affected = Some(extract_row_affected(&body)?);
+                    let rows_affected = extract_row_affected(&body)?;
+                    *this.rows_affected = Some(rows_affected);
+                    return Poll::Ready(Some(Ok(GenericResult::Command(
+                        rows_affected,
+                        body.tag().map_err(Error::parse)?.to_string(),
+                    ))));
                 }
                 Message::EmptyQueryResponse | Message::PortalSuspended => {}
                 Message::ReadyForQuery(_) => return Poll::Ready(None),
