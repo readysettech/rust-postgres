@@ -16,7 +16,8 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::tls::{NoTls, NoTlsStream};
 use tokio_postgres::types::{Kind, Type};
 use tokio_postgres::{
-    AsyncMessage, Client, Config, Connection, Error, IsolationLevel, SimpleQueryMessage,
+    AsyncMessage, Client, CommandCompleteContents, Config, Connection, Error, GenericResult,
+    IsolationLevel, SimpleQueryMessage,
 };
 
 mod binary_copy;
@@ -188,6 +189,51 @@ async fn insert_select() {
 }
 
 #[tokio::test]
+async fn generic_query() {
+    let client = connect("user=postgres").await;
+
+    client
+        .batch_execute("CREATE TEMPORARY TABLE foo (id SERIAL, name TEXT)")
+        .await
+        .unwrap();
+    let insert = client
+        .generic_query(
+            "INSERT INTO foo(name) VALUES($1), ($2)",
+            &[&"alice", &"bob"],
+        )
+        .await
+        .unwrap();
+    let select = client
+        .generic_query("SELECT id, name FROM foo ORDER BY id", &[])
+        .await
+        .unwrap();
+
+    let rows_written = match insert[0] {
+        GenericResult::Row(_) => 0, // failure case
+        GenericResult::Command(r, _) => r,
+    };
+    assert_eq!(rows_written, 2);
+    let mut s = select.iter();
+    if let GenericResult::Row(row) = s.next().unwrap() {
+        assert_eq!(row.get::<_, i32>(0), 1);
+        assert_eq!(row.get::<_, &str>(1), "alice");
+    } else {
+        panic!();
+    }
+    if let GenericResult::Row(row) = s.next().unwrap() {
+        assert_eq!(row.get::<_, i32>(0), 2);
+        assert_eq!(row.get::<_, &str>(1), "bob");
+    } else {
+        panic!();
+    }
+    if let GenericResult::Command(rows_read, _) = s.next().unwrap() {
+        assert_eq!(*rows_read, 2);
+    } else {
+        panic!();
+    }
+}
+
+#[tokio::test]
 async fn custom_enum() {
     let client = connect("user=postgres").await;
 
@@ -301,6 +347,88 @@ async fn custom_range() {
     assert_eq!("floatrange", ty.name());
     assert_eq!(&Kind::Range(Type::FLOAT8), ty.kind());
 }
+/// This test check to make sure that empty responses for select queries include the header but not
+/// for other query types.
+#[tokio::test]
+async fn simple_query_select_transaction() {
+    let client = connect("user=postgres").await;
+
+    let _ = client.simple_query("DROP TABLE sbtest1").await.unwrap();
+    let _ = client.simple_query("DROP TABLE sbtest2").await.unwrap();
+    let _ = client
+        .simple_query("CREATE TABLE sbtest1 (id INTEGER, k INTEGER);")
+        .await
+        .unwrap();
+    let _ = client
+        .simple_query("CREATE TABLE sbtest2 (id INTEGER, k INTEGER);")
+        .await
+        .unwrap();
+
+    let messages = client
+        .simple_query(
+            "INSERT INTO sbtest1  VALUES (1, 2);
+            INSERT INTO sbtest2  VALUES (1, 2);
+            SELECT * FROM sbtest1 ORDER BY id;
+            SELECT k FROM sbtest1 WHERE id = 999;
+            BEGIN;
+            UPDATE sbtest1 SET k=id;
+            UPDATE sbtest2 SET k=id;
+            END;",
+        )
+        .await
+        .unwrap();
+
+    match messages[0] {
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { rows: 1, .. }) => {}
+        _ => panic!("unexpected message or too many rows"),
+    }
+    match messages[1] {
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { rows: 1, .. }) => {}
+        _ => panic!("unexpected message or too many rows"),
+    }
+    match &messages[2] {
+        SimpleQueryMessage::Row(row) => {
+            assert_eq!(row.columns().get(0).map(|c| c.name()), Some("id"));
+            assert_eq!(row.columns().get(1).map(|c| c.name()), Some("k"));
+            assert_eq!(row.get(0), Some("1"));
+            assert_eq!(row.get(1), Some("2"));
+        }
+        _ => panic!("unexpected message"),
+    }
+    match &messages[3] {
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { fields: None, .. }) => {}
+        _ => panic!("unexpected message or fields are not empty "),
+    }
+    match &messages[4] {
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { fields, .. }) => {
+            if let Some(field_vec) = &fields {
+                assert_eq!((&**field_vec).len(), 1);
+                assert_eq!("k", (&**field_vec)[0].name());
+            } else {
+                panic!("No data found");
+            }
+        }
+        _ => panic!("unexpected message"),
+    }
+    match &messages[5] {
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { fields: None, .. }) => {}
+        _ => panic!("unexpected message or fields are not empty"),
+    }
+    match &messages[6] {
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { fields: None, .. }) => {}
+        _ => panic!("unexpected message or fields are not empty"),
+    }
+    match &messages[7] {
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { fields: None, .. }) => {}
+        _ => panic!("unexpected message or fields are not empty"),
+    }
+    match &messages[8] {
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { fields: None, .. }) => {}
+        _ => panic!("unexpected message or fields are not empty"),
+    }
+
+    assert_eq!(messages.len(), 9);
+}
 
 #[tokio::test]
 #[allow(clippy::get_first)]
@@ -320,11 +448,11 @@ async fn simple_query() {
         .unwrap();
 
     match messages[0] {
-        SimpleQueryMessage::CommandComplete(0) => {}
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { rows: 0, .. }) => {}
         _ => panic!("unexpected message"),
     }
     match messages[1] {
-        SimpleQueryMessage::CommandComplete(2) => {}
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { rows: 2, .. }) => {}
         _ => panic!("unexpected message"),
     }
     match &messages[2] {
@@ -353,7 +481,7 @@ async fn simple_query() {
         _ => panic!("unexpected message"),
     }
     match messages[5] {
-        SimpleQueryMessage::CommandComplete(2) => {}
+        SimpleQueryMessage::CommandComplete(CommandCompleteContents { rows: 2, .. }) => {}
         _ => panic!("unexpected message"),
     }
     assert_eq!(messages.len(), 6);

@@ -117,7 +117,7 @@
 //! | `with-uuid-1` | Enable support for the `uuid` crate. | [uuid](https://crates.io/crates/uuid) 1.0 | no |
 //! | `with-time-0_2` | Enable support for the 0.2 version of the `time` crate. | [time](https://crates.io/crates/time/0.2.0) 0.2 | no |
 //! | `with-time-0_3` | Enable support for the 0.3 version of the `time` crate. | [time](https://crates.io/crates/time/0.3.0) 0.3 | no |
-#![warn(rust_2018_idioms, clippy::all, missing_docs)]
+#![warn(rust_2018_idioms, clippy::all)]
 
 pub use crate::cancel_token::CancelToken;
 pub use crate::client::Client;
@@ -128,8 +128,9 @@ pub use crate::copy_out::CopyOutStream;
 use crate::error::DbError;
 pub use crate::error::Error;
 pub use crate::generic_client::GenericClient;
+pub use crate::generic_result::GenericResult;
 pub use crate::portal::Portal;
-pub use crate::query::RowStream;
+pub use crate::query::{ResultStream, RowStream};
 pub use crate::row::{Row, SimpleQueryRow};
 pub use crate::simple_query::{SimpleColumn, SimpleQueryStream};
 #[cfg(feature = "runtime")]
@@ -143,6 +144,8 @@ pub use crate::transaction::Transaction;
 pub use crate::transaction_builder::{IsolationLevel, TransactionBuilder};
 use crate::types::ToSql;
 use std::sync::Arc;
+use bytes::Bytes;
+pub use postgres_protocol::message::backend::{Message, OwnedField};
 
 pub mod binary_copy;
 mod bind;
@@ -150,8 +153,8 @@ mod bind;
 mod cancel_query;
 mod cancel_query_raw;
 mod cancel_token;
-mod client;
-mod codec;
+pub mod client;
+pub mod codec;
 pub mod config;
 #[cfg(feature = "runtime")]
 mod connect;
@@ -159,11 +162,12 @@ mod connect_raw;
 #[cfg(feature = "runtime")]
 mod connect_socket;
 mod connect_tls;
-mod connection;
+pub mod connection;
 mod copy_in;
 mod copy_out;
 pub mod error;
 mod generic_client;
+pub mod generic_result;
 #[cfg(not(target_arch = "wasm32"))]
 mod keepalive;
 mod maybe_tls_stream;
@@ -171,7 +175,7 @@ mod portal;
 mod prepare;
 mod query;
 pub mod row;
-mod simple_query;
+pub mod simple_query;
 #[cfg(feature = "runtime")]
 mod socket;
 mod statement;
@@ -180,6 +184,15 @@ mod to_statement;
 mod transaction;
 mod transaction_builder;
 pub mod types;
+
+/// This crate was originally written to use binary result format for pretty much everything, and
+/// it's still the case in most parts of the code that we hardcode to use binary. There are some
+/// small use cases we've hacked in where you can specify different result formats, though.
+/// Since Postgres lets you specify different result formats for different columns, we generally
+/// accept an IntoIterator<Item = i16> since each result format is specified as an i16 value of 0
+/// for text or 1 for binary. However, if you only specify a single format, Postgres interprets
+/// that as "use this format for everything", hence Some(1) being the default here:
+pub(crate) const DEFAULT_RESULT_FORMATS: Option<i16> = Some(1);
 
 /// A convenience function which parses a connection string and connects to the database.
 ///
@@ -248,10 +261,20 @@ pub enum SimpleQueryMessage {
     Row(SimpleQueryRow),
     /// A statement in the query has completed.
     ///
-    /// The number of rows modified or selected is returned.
-    CommandComplete(u64),
+    /// The full tag, along with the rows modified or selected are returned.
+    CommandComplete(CommandCompleteContents),
     /// Column values of the proceeding row values
     RowDescription(Arc<[SimpleColumn]>),
+}
+
+#[derive(Eq, PartialEq, Debug)]
+pub struct CommandCompleteContents {
+    /// Fields, if relevant for the CommandCompleteContents.
+    pub fields: Option<Arc<[OwnedField]>>,
+    /// The number of rows modified or selected.
+    pub rows: u64,
+    /// The full tag in bytes of the CommandComplete body.
+    pub tag: Bytes,
 }
 
 fn slice_iter<'a>(
