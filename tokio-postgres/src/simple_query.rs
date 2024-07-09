@@ -8,7 +8,7 @@ use fallible_iterator::FallibleIterator;
 use futures_util::{ready, Stream};
 use log::debug;
 use pin_project_lite::pin_project;
-use postgres_protocol::message::backend::Message;
+use postgres_protocol::message::backend::{Message, OwnedField};
 use postgres_protocol::message::frontend;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
@@ -40,7 +40,8 @@ pub async fn simple_query(client: &InnerClient, query: &str) -> Result<SimpleQue
 
     Ok(SimpleQueryStream {
         responses,
-        columns: None,
+        fields: None,
+        include_fields_in_complete: true,
         _p: PhantomPinned,
     })
 }
@@ -63,7 +64,7 @@ pub async fn batch_execute(client: &InnerClient, query: &str) -> Result<(), Erro
     }
 }
 
-fn encode(client: &InnerClient, query: &str) -> Result<Bytes, Error> {
+pub fn encode(client: &InnerClient, query: &str) -> Result<Bytes, Error> {
     client.with_buf(|buf| {
         frontend::query(query, buf).map_err(Error::encode)?;
         Ok(buf.split().freeze())
@@ -74,7 +75,8 @@ pin_project! {
     /// A stream of simple query results.
     pub struct SimpleQueryStream {
         responses: Responses,
-        columns: Option<Arc<[SimpleColumn]>>,
+        fields: Option<Arc<[OwnedField]>>,
+        include_fields_in_complete: bool,
         #[pin]
         _p: PhantomPinned,
     }
@@ -83,30 +85,63 @@ pin_project! {
 impl Stream for SimpleQueryStream {
     type Item = Result<SimpleQueryMessage, Error>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().project();
         match ready!(this.responses.poll_next(cx)?) {
             Message::CommandComplete(body) => {
                 let rows = extract_row_affected(&body)?;
-                Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(rows))))
+                let fields = if *this.include_fields_in_complete {
+                    if body.tag().expect("Failed to get tag").starts_with("SELECT") {
+                        this.fields.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    // Reset bool for next grouping
+                    *this.include_fields_in_complete = true;
+                    None
+                };
+                Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(
+                    crate::CommandCompleteContents {
+                        fields,
+                        rows,
+                        tag: body.into_bytes(),
+                    },
+                ))))
             }
             Message::EmptyQueryResponse => {
-                Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(0))))
+                let fields = if *this.include_fields_in_complete {
+                    this.fields.clone()
+                } else {
+                    // Reset bool for next grouping
+                    *this.include_fields_in_complete = true;
+                    None
+                };
+                Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(
+                    crate::CommandCompleteContents {
+                        fields,
+                        rows: 0,
+                        tag: Bytes::new(),
+                    },
+                ))))
             }
             Message::RowDescription(body) => {
-                let columns: Arc<[SimpleColumn]> = body
+                let fields = body
                     .fields()
-                    .map(|f| Ok(SimpleColumn::new(f.name().to_string())))
+                    .map(|f| Ok(f.into()))
                     .collect::<Vec<_>>()
                     .map_err(Error::parse)?
                     .into();
 
-                *this.columns = Some(columns.clone());
-                Poll::Ready(Some(Ok(SimpleQueryMessage::RowDescription(columns))))
+                *this.fields = Some(fields);
+                self.poll_next(cx)
             }
             Message::DataRow(body) => {
-                let row = match &this.columns {
-                    Some(columns) => SimpleQueryRow::new(columns.clone(), body)?,
+                let row = match &this.fields {
+                    Some(fields) => {
+                        *this.include_fields_in_complete = false;
+                        SimpleQueryRow::new(fields.clone(), body)?
+                    }
                     None => return Poll::Ready(Some(Err(Error::unexpected_message()))),
                 };
                 Poll::Ready(Some(Ok(SimpleQueryMessage::Row(row))))
