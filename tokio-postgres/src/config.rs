@@ -234,6 +234,7 @@ pub struct Config {
     pub(crate) keepalive_config: KeepaliveConfig,
     pub(crate) target_session_attrs: TargetSessionAttrs,
     pub(crate) channel_binding: ChannelBinding,
+    pub(crate) replication: Option<String>,
     pub(crate) load_balance_hosts: LoadBalanceHosts,
 }
 
@@ -268,6 +269,7 @@ impl Config {
             },
             target_session_attrs: TargetSessionAttrs::Any,
             channel_binding: ChannelBinding::Prefer,
+            replication: None,
             load_balance_hosts: LoadBalanceHosts::Disable,
         }
     }
@@ -306,6 +308,12 @@ impl Config {
     /// Defaults to the user.
     pub fn dbname(&mut self, dbname: impl Into<String>) -> &mut Config {
         self.dbname = Some(dbname.into());
+        self
+    }
+
+    /// Sets the kind of replication.
+    pub fn set_replication_database(&mut self) -> &mut Config {
+        self.replication = Some("database".to_string());
         self
     }
 
@@ -699,6 +707,9 @@ impl Config {
                     }
                 };
                 self.channel_binding(channel_binding);
+            }
+            "replication" => {
+                self.replication = Some(value.to_string());
             }
             "load_balance_hosts" => {
                 let load_balance_hosts = match value {

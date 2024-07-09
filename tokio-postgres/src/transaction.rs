@@ -7,8 +7,8 @@ use crate::tls::MakeTlsConnect;
 use crate::tls::TlsConnect;
 use crate::types::{BorrowToSql, ToSql, Type};
 use crate::{
-    CancelToken, Client, CopyInSink, Error, Portal, Row, SimpleQueryMessage, Statement,
-    ToStatement, bind, query, slice_iter,
+    bind, query, slice_iter, CancelToken, Client, CopyInSink, Error, GenericResult, Portal, Row,
+    SimpleQueryMessage, Statement, ToStatement, DEFAULT_RESULT_FORMATS,
 };
 use bytes::Buf;
 use futures_util::TryStreamExt;
@@ -168,7 +168,9 @@ impl<'a> Transaction<'a> {
         P: BorrowToSql,
         I: IntoIterator<Item = (P, Type)>,
     {
-        self.client.query_typed_raw(query, params).await
+        self.client
+            .query_typed_raw(query, params, DEFAULT_RESULT_FORMATS)
+            .await
     }
 
     /// Like `Client::execute`.
@@ -246,10 +248,15 @@ impl<'a> Transaction<'a> {
     pub async fn query_portal(&self, portal: &Portal, max_rows: i32) -> Result<Vec<Row>, Error> {
         self.query_portal_raw(portal, max_rows)
             .await?
+            .try_filter_map(|result| async move {
+                match result {
+                    GenericResult::Row(row) => Ok(Some(row)),
+                    GenericResult::Command(_, _) => Ok(None),
+                }
+            })
             .try_collect()
             .await
     }
-
     /// The maximally flexible version of [`query_portal`].
     ///
     /// [`query_portal`]: #method.query_portal
