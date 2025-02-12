@@ -2,7 +2,7 @@ use crate::connection::ConnectionRef;
 use fallible_iterator::FallibleIterator;
 use futures_util::StreamExt;
 use std::pin::Pin;
-use tokio_postgres::{Error, Row, RowStream};
+use tokio_postgres::{Error, GenericResult, Row, RowStream};
 
 /// The iterator returned by `query_raw`.
 pub struct RowIter<'a> {
@@ -32,7 +32,14 @@ impl FallibleIterator for RowIter<'_> {
 
     fn next(&mut self) -> Result<Option<Row>, Error> {
         let it = &mut self.it;
-        self.connection
-            .block_on(async { it.next().await.transpose() })
+        self.connection.block_on(async {
+            loop {
+                match it.next().await.transpose()? {
+                    Some(GenericResult::Row(row)) => return Ok(Some(row)),
+                    Some(GenericResult::Command(_, _)) => {}
+                    None => return Ok(None),
+                }
+            }
+        })
     }
 }

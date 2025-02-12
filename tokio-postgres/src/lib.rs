@@ -192,7 +192,7 @@ pub mod types;
 /// accept an IntoIterator<Item = i16> since each result format is specified as an i16 value of 0
 /// for text or 1 for binary. However, if you only specify a single format, Postgres interprets
 /// that as "use this format for everything", hence Some(1) being the default here:
-pub(crate) const DEFAULT_RESULT_FORMATS: Option<i16> = Some(1);
+pub const DEFAULT_RESULT_FORMATS: Option<i16> = Some(1);
 
 /// A convenience function which parses a connection string and connects to the database.
 ///

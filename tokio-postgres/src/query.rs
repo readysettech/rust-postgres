@@ -61,14 +61,16 @@ where
     })
 }
 
-pub async fn query_typed<'a, P, I>(
+pub async fn query_typed<'a, P, I, J>(
     client: &Arc<InnerClient>,
     query: &str,
     params: I,
+    result_formats: J,
 ) -> Result<RowStream, Error>
 where
     P: BorrowToSql,
     I: IntoIterator<Item = (P, Type)>,
+    J: IntoIterator<Item = i16>,
 {
     let buf = {
         let params = params.into_iter().collect::<Vec<_>>();
@@ -76,7 +78,7 @@ where
 
         client.with_buf(|buf| {
             frontend::parse("", query, param_oids.into_iter(), buf).map_err(Error::parse)?;
-            encode_bind_raw("", params, "", buf, Some(1))?;
+            encode_bind_raw("", params, "", buf, result_formats)?;
             frontend::describe(b'S', "", buf).map_err(Error::encode)?;
             frontend::execute("", 0, buf).map_err(Error::encode)?;
             frontend::sync(buf);
@@ -380,17 +382,25 @@ pin_project! {
 }
 
 impl Stream for RowStream {
-    type Item = Result<Row, Error>;
+    type Item = Result<GenericResult, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         loop {
             match ready!(this.responses.poll_next(cx)?) {
                 Message::DataRow(body) => {
-                    return Poll::Ready(Some(Ok(Row::new(this.statement.clone(), body)?)))
+                    return Poll::Ready(Some(Ok(GenericResult::Row(Row::new(
+                        this.statement.clone(),
+                        body,
+                    )?))))
                 }
                 Message::CommandComplete(body) => {
-                    *this.rows_affected = Some(extract_row_affected(&body)?);
+                    let rows_affected = extract_row_affected(&body)?;
+                    *this.rows_affected = Some(rows_affected);
+                    return Poll::Ready(Some(Ok(GenericResult::Command(
+                        rows_affected,
+                        body.tag().map_err(Error::parse)?.to_string(),
+                    ))));
                 }
                 Message::EmptyQueryResponse | Message::PortalSuspended => {}
                 Message::ReadyForQuery(_) => return Poll::Ready(None),

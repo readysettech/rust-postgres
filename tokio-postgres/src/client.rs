@@ -254,6 +254,12 @@ impl Client {
     {
         self.query_raw(statement, slice_iter(params))
             .await?
+            .try_filter_map(|result| async move {
+                match result {
+                    GenericResult::Row(row) => Ok(Some(row)),
+                    GenericResult::Command(_, _) => Ok(None),
+                }
+            })
             .try_collect()
             .await
     }
@@ -326,11 +332,15 @@ impl Client {
         // However, this new form with only one .await in a loop generates
         // slightly smaller codegen/stack usage for the resulting future.
         while let Some(row) = stream.try_next().await? {
-            if first.is_some() {
-                return Err(Error::row_count());
+            match row {
+                GenericResult::Row(row) => {
+                    if first.is_some() {
+                        return Err(Error::row_count());
+                    }
+                    first = Some(row);
+                }
+                GenericResult::Command(_, _) => {}
             }
-
-            first = Some(row);
         }
 
         Ok(first)
@@ -395,10 +405,20 @@ impl Client {
         query: &str,
         params: &[(&(dyn ToSql + Sync), Type)],
     ) -> Result<Vec<Row>, Error> {
-        self.query_typed_raw(query, params.iter().map(|(v, t)| (*v, t.clone())))
-            .await?
-            .try_collect()
-            .await
+        self.query_typed_raw(
+            query,
+            params.iter().map(|(v, t)| (*v, t.clone())),
+            DEFAULT_RESULT_FORMATS,
+        )
+        .await?
+        .try_filter_map(|result| async move {
+            match result {
+                GenericResult::Row(row) => Ok(Some(row)),
+                GenericResult::Command(_, _) => Ok(None),
+            }
+        })
+        .try_collect()
+        .await
     }
 
     /// The maximally flexible version of [`query_typed`].
@@ -437,12 +457,18 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn query_typed_raw<P, I>(&self, query: &str, params: I) -> Result<RowStream, Error>
+    pub async fn query_typed_raw<P, I, J>(
+        &self,
+        query: &str,
+        params: I,
+        result_formats: J,
+    ) -> Result<RowStream, Error>
     where
         P: BorrowToSql,
         I: IntoIterator<Item = (P, Type)>,
+        J: IntoIterator<Item = i16>,
     {
-        query::query_typed(&self.inner, query, params).await
+        query::query_typed(&self.inner, query, params, result_formats).await
     }
 
     /// Executes a generic query.
